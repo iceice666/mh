@@ -1,0 +1,44 @@
+{
+  "nodes": {
+    "mquickjs": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1780583325,
+        "narHash": "sha256-QnLw0DAAR5iZn6Kx15VbdAOh1ksKnCusPq23PMCzAHQ=",
+        "owner": "bellard",
+        "repo": "mquickjs",
+        "rev": "203d5bb79789bc47b74855d9207415dab71661a0",
+        "type": "github"
+      },
+      "original": {
+        "owner": "bellard",
+        "repo": "mquickjs",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1787135253,
+        "narHash": "sha256-RD2kNWCG+Bjo6h+JVjWVNntZs2GtRoeY2xHjts/FNkA=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "ffb3c9b700e759be2ef13237c9d8f953b32a1e46",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-unstable",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "mquickjs": "mquickjs",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}
