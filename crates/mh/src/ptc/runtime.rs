@@ -10,6 +10,7 @@
 //! Rust that must survive further allocation are pushed through
 //! [`GcRoot`], which wraps `JS_PushGCRef`/`JS_PopGCRef`.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,11 +19,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::checkpoint::{Checkpoint, CheckpointStore};
+use crate::identity::{ExecutionId, RevisionId, TaskId};
 use crate::session::EvidenceRecord;
 use crate::tools::capability::Capabilities;
 use crate::tools::fs_tools;
 use crate::tools::store::ResultStore;
-use crate::tools::{ResultId, ToolEffect};
+use crate::tools::{ResultId, ToolEffects};
+use crate::workspace::{RevisionSource, WorkspaceTracker};
 
 use super::wrapper::{JSValue, Vm, VmError};
 
@@ -99,48 +103,95 @@ pub enum HostCallOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PtcEvent {
     HostCallStarted {
+        task_id: TaskId,
+        execution_id: ExecutionId,
         call_id: u64,
         name: String,
         args_hash: u64,
     },
     HostCallCompleted {
+        task_id: TaskId,
+        execution_id: ExecutionId,
         call_id: u64,
         name: String,
         args_hash: u64,
-        effect: ToolEffect,
+        effects: ToolEffects,
         outcome: HostCallOutcome,
         ok: bool,
         duration_ms: u64,
         result_ids: Vec<ResultId>,
         paths: Vec<String>,
     },
+    WorkspaceRevisionChanged {
+        task_id: TaskId,
+        execution_id: ExecutionId,
+        from: RevisionId,
+        to: RevisionId,
+        added: Vec<String>,
+        modified: Vec<String>,
+        deleted: Vec<String>,
+        source: RevisionSource,
+    },
     EvidenceRecorded {
         evidence: EvidenceRecord,
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtcEventSinkError(pub String);
+
+impl std::fmt::Display for PtcEventSinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PtcEventSinkError {}
+
+impl PtcEventSinkError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+pub trait PtcEventSink: Send + Sync {
+    fn emit(&self, event: PtcEvent) -> Result<(), PtcEventSinkError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtcExecution {
+    pub task_id: TaskId,
+    pub execution_id: ExecutionId,
+    pub start_revision: RevisionId,
+}
+
 /// Result of one PTC execution.
 #[derive(Debug, Clone)]
 pub struct PtcResult {
-    /// JSON view of the program's returned value (`undefined` → null).
     pub value: Value,
     pub outcome: PtcOutcome,
+    pub task_id: TaskId,
+    pub execution_id: ExecutionId,
+    pub start_revision: RevisionId,
+    pub end_revision: RevisionId,
     pub tool_calls: usize,
     pub duration_ms: u64,
     pub events: Vec<PtcEvent>,
-    pub mutation_epoch: u64,
     pub diagnostic: Option<PtcDiagnostic>,
 }
 
 struct ExecState {
     cancelled: Arc<AtomicBool>,
     deadline: Instant,
+    execution: PtcExecution,
+    current_revision: Mutex<RevisionId>,
     tool_calls: AtomicU64,
     process_calls: AtomicU64,
     interrupt_polls: AtomicU64,
     next_call_id: AtomicU64,
-    mutation_epoch: AtomicU64,
     events: Mutex<Vec<PtcEvent>>,
+    sink: Option<Arc<dyn PtcEventSink>>,
+    checkpoints: Mutex<HashMap<u64, Checkpoint>>,
+    sink_error: Mutex<Option<PtcEventSinkError>>,
     max_tool_calls: u64,
     max_processes: u64,
     max_interrupt_polls: Option<u64>,
@@ -214,39 +265,48 @@ pub struct PtcRuntime {
     caps: Capabilities,
     store: ResultStore,
     budget: PtcBudget,
+    tracker: Arc<dyn WorkspaceTracker>,
+    checkpoints: CheckpointStore,
 }
 
 impl PtcRuntime {
-    pub fn new(caps: Capabilities, store: ResultStore, budget: PtcBudget) -> Self {
+    pub fn new(
+        caps: Capabilities,
+        store: ResultStore,
+        budget: PtcBudget,
+        tracker: Arc<dyn WorkspaceTracker>,
+        checkpoints: CheckpointStore,
+    ) -> Self {
         Self {
             caps,
             store,
             budget,
+            tracker,
+            checkpoints,
         }
     }
 
-    /// Executes at mutation epoch zero.
-    pub fn execute(&self, program: &str, cancelled: &Arc<AtomicBool>) -> PtcResult {
-        self.execute_at_epoch(program, cancelled, 0)
-    }
-
-    /// Executes `program`, projecting mutations from `mutation_epoch`.
-    pub fn execute_at_epoch(
+    pub fn execute(
         &self,
         program: &str,
-        cancelled: &Arc<AtomicBool>,
-        mutation_epoch: u64,
+        cancelled: Arc<AtomicBool>,
+        execution: PtcExecution,
+        sink: Option<Arc<dyn PtcEventSink>>,
     ) -> PtcResult {
         let start = Instant::now();
         let state = Box::new(ExecState {
-            cancelled: cancelled.clone(),
+            cancelled,
             deadline: start + Duration::from_millis(self.budget.wall_time_ms),
+            current_revision: Mutex::new(execution.start_revision.clone()),
+            execution,
             tool_calls: AtomicU64::new(0),
             process_calls: AtomicU64::new(0),
             interrupt_polls: AtomicU64::new(0),
             next_call_id: AtomicU64::new(1),
-            mutation_epoch: AtomicU64::new(mutation_epoch),
             events: Mutex::new(Vec::new()),
+            checkpoints: Mutex::new(HashMap::new()),
+            sink,
+            sink_error: Mutex::new(None),
             max_tool_calls: self.budget.max_tool_calls as u64,
             max_processes: self.budget.max_processes as u64,
             max_interrupt_polls: self
@@ -259,8 +319,8 @@ impl PtcRuntime {
         let mut vm = match Vm::with_heap(self.budget.heap_bytes) {
             Ok(v) => v,
             Err(e) => {
-                unsafe { drop(Box::from_raw(state_ptr)) };
-                return empty_result(PtcOutcome::Failed(e.to_string()), start, mutation_epoch);
+                let state = unsafe { Box::from_raw(state_ptr) };
+                return empty_result(PtcOutcome::Failed(e.to_string()), start, &state.execution);
             }
         };
 
@@ -270,11 +330,13 @@ impl PtcRuntime {
             caps: &self.caps,
             store: &self.store,
             budget: &self.budget,
+            tracker: self.tracker.as_ref(),
+            checkpoints: &self.checkpoints,
         });
         let dispatch_ptr = Box::into_raw(dispatch);
         unsafe { vm.install_opaque(dispatch_ptr.cast::<c_void>(), interrupt_handler) };
 
-        let execution = (|| -> (Value, PtcOutcome, Option<PtcDiagnostic>) {
+        let execution_result = (|| -> (Value, PtcOutcome, Option<PtcDiagnostic>) {
             if let Err(e) = self.install_globals(&mut vm) {
                 let message = e.to_string();
                 return (
@@ -287,7 +349,12 @@ impl PtcRuntime {
             let val = match vm.eval(&wrapped, "ptc.js") {
                 Ok(v) => v,
                 Err(VmError::Exception(msg)) => {
-                    let diag = classify_diagnostic(program, &msg, cancelled, dispatch_ptr);
+                    let diag = classify_diagnostic(
+                        program,
+                        &msg,
+                        unsafe { &(*state_ptr).cancelled },
+                        dispatch_ptr,
+                    );
                     let outcome = match diag.kind {
                         PtcDiagnosticKind::Cancelled => PtcOutcome::Interrupted,
                         PtcDiagnosticKind::WallTime => PtcOutcome::BudgetExceeded("wall time"),
@@ -315,21 +382,43 @@ impl PtcRuntime {
             )
         })();
 
-        let state = unsafe { &*state_ptr };
-        let result = PtcResult {
-            value: execution.0,
-            outcome: execution.1,
+        // The VM may invoke the opaque callback while it is being destroyed.
+        // Its backing state and dispatch box must therefore outlive this drop.
+        drop(vm);
+        let dispatch = unsafe { Box::from_raw(dispatch_ptr) };
+        drop(dispatch);
+        let state = unsafe { Box::from_raw(state_ptr) };
+        let sink_error = state
+            .sink_error
+            .lock()
+            .expect("sink error poisoned")
+            .clone();
+        let (outcome, diagnostic) = if let Some(error) = sink_error {
+            let message = format!("PTC event sink failed: {error}");
+            (
+                PtcOutcome::Failed(message.clone()),
+                Some(diagnostic(PtcDiagnosticKind::Runtime, message)),
+            )
+        } else {
+            (execution_result.1, execution_result.2)
+        };
+        let end_revision = state
+            .current_revision
+            .lock()
+            .expect("revision poisoned")
+            .clone();
+        PtcResult {
+            value: execution_result.0,
+            outcome,
+            task_id: state.execution.task_id,
+            execution_id: state.execution.execution_id,
+            start_revision: state.execution.start_revision.clone(),
+            end_revision,
             tool_calls: state.tool_calls.load(Ordering::Relaxed) as usize,
             duration_ms: elapsed_ms(start),
             events: state.events.lock().expect("event trace poisoned").clone(),
-            mutation_epoch: state.mutation_epoch.load(Ordering::Relaxed),
-            diagnostic: execution.2,
-        };
-        unsafe {
-            drop(Box::from_raw(dispatch_ptr));
-            drop(Box::from_raw(state_ptr));
+            diagnostic,
         }
-        result
     }
 
     fn install_globals(&self, vm: &mut Vm) -> Result<(), VmError> {
@@ -353,6 +442,8 @@ impl PtcRuntime {
             "exec",
             "batch",
             "evidence",
+            "checkpoint",
+            "restore",
         ] {
             let f = unsafe { GcRoot::new(vm, make_fn(vm, name)) };
             v.set(g, name, f.get())?;
@@ -369,6 +460,8 @@ impl PtcRuntime {
             "call_tool",
             "batch",
             "evidence",
+            "checkpoint",
+            "restore",
         ] {
             let f = unsafe { GcRoot::new(vm, make_fn(vm, name)) };
             v.set(tools.get(), name, f.get())?;
@@ -382,14 +475,17 @@ fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn empty_result(outcome: PtcOutcome, start: Instant, mutation_epoch: u64) -> PtcResult {
+fn empty_result(outcome: PtcOutcome, start: Instant, execution: &PtcExecution) -> PtcResult {
     PtcResult {
         value: Value::Null,
         outcome,
+        task_id: execution.task_id,
+        execution_id: execution.execution_id,
+        start_revision: execution.start_revision.clone(),
+        end_revision: execution.start_revision.clone(),
         tool_calls: 0,
         duration_ms: elapsed_ms(start),
         events: Vec::new(),
-        mutation_epoch,
         diagnostic: None,
     }
 }
@@ -462,6 +558,8 @@ struct DispatchBox<'a> {
     caps: &'a Capabilities,
     store: &'a ResultStore,
     budget: &'a PtcBudget,
+    tracker: &'a dyn WorkspaceTracker,
+    checkpoints: &'a CheckpointStore,
 }
 
 fn instruction_budget_exceeded(p: *mut DispatchBox) -> bool {
@@ -594,6 +692,22 @@ unsafe fn run_host_call(
             ensure_direct_host_call(&out)?;
             Ok(exec_result_to_vm(vm, d, &out))
         }
+        "checkpoint" => {
+            let out = execute_child(d, "checkpoint", Value::Null, true);
+            ensure_direct_host_call(&out)?;
+            Ok(json_to_vm(vm, &out))
+        }
+        "restore" => {
+            let checkpoint = arg(0).ok_or("restore(checkpoint)")?;
+            let out = execute_child(
+                d,
+                "restore",
+                vm_to_json(vm, checkpoint, d.budget.max_output_bytes),
+                true,
+            );
+            ensure_direct_host_call(&out)?;
+            Ok(json_to_vm(vm, &out))
+        }
         "batch" => {
             if d.state.cancelled.load(Ordering::Relaxed) {
                 return Err("cancelled".to_string());
@@ -636,11 +750,8 @@ unsafe fn run_host_call(
                 .map(|a| vm_to_json(vm, a, d.budget.max_output_bytes))
                 .unwrap_or(Value::Null);
             let evidence = evidence_record(d, kind, ok, &metadata);
-            d.state
-                .events
-                .lock()
-                .expect("event trace poisoned")
-                .push(PtcEvent::EvidenceRecorded { evidence });
+            emit_event(d.state, PtcEvent::EvidenceRecorded { evidence })
+                .map_err(|error| error.to_string())?;
             Ok(v.undefined())
         }
         "tr_read" => {
@@ -744,17 +855,20 @@ fn execute_batch(d: &DispatchBox, name: &str, items: &[Value]) -> Vec<Value> {
 fn execute_child(d: &DispatchBox, name: &str, args: Value, count_budget: bool) -> Value {
     let call_id = d.state.next_call_id.fetch_add(1, Ordering::Relaxed);
     let args_hash = stable_args_hash(&args);
-    d.state
-        .events
-        .lock()
-        .expect("event trace poisoned")
-        .push(PtcEvent::HostCallStarted {
+    let execution = &d.state.execution;
+    let sink_failed = emit_event(
+        d.state,
+        PtcEvent::HostCallStarted {
+            task_id: execution.task_id,
+            execution_id: execution.execution_id,
             call_id,
             name: name.to_string(),
             args_hash,
-        });
+        },
+    )
+    .is_err();
     let started = Instant::now();
-    let mut budget_error = None;
+    let mut budget_error = sink_failed.then_some("event sink failed");
     if count_budget {
         let calls = d.state.tool_calls.fetch_add(1, Ordering::Relaxed) + 1;
         if calls > d.state.max_tool_calls {
@@ -767,6 +881,11 @@ fn execute_child(d: &DispatchBox, name: &str, args: Value, count_budget: bool) -
             budget_error = Some("process budget exceeded");
         }
     }
+    let tracks_revision = matches!(name, "write" | "edit" | "exec" | "restore");
+    let before = tracks_revision
+        .then(|| d.tracker.current_revision().ok())
+        .flatten();
+    let mut restored_revision = None;
     let output = if let Some(error) = budget_error {
         json!({ "error": error })
     } else if d.state.cancelled.load(Ordering::Relaxed) {
@@ -781,6 +900,42 @@ fn execute_child(d: &DispatchBox, name: &str, args: Value, count_budget: bool) -
             "exec" => fs_tools::exec(d.caps, d.store, &args, d.budget.max_result_bytes, &|| {
                 d.state.cancelled.load(Ordering::Relaxed)
             }),
+            "checkpoint" => match d.checkpoints.create(execution.task_id) {
+                Ok(checkpoint) => {
+                    d.state
+                        .checkpoints
+                        .lock()
+                        .expect("checkpoint map poisoned")
+                        .insert(checkpoint.id.0, checkpoint.clone());
+                    json!({ "id": checkpoint.id.0, "revision": checkpoint.revision.0 })
+                }
+                Err(error) => json!({ "error": error.to_string() }),
+            },
+            "restore" => {
+                let id = args.get("id").and_then(Value::as_u64);
+                let revision = args.get("revision").and_then(Value::as_str);
+                let checkpoint = id.and_then(|id| {
+                    d.state
+                        .checkpoints
+                        .lock()
+                        .expect("checkpoint map poisoned")
+                        .get(&id)
+                        .cloned()
+                });
+                match checkpoint {
+                    Some(checkpoint) if revision == Some(checkpoint.revision.0.as_str()) => {
+                        match d.checkpoints.restore(execution.task_id, &checkpoint) {
+                            Ok(restored) => {
+                                restored_revision = Some(restored.clone());
+                                json!({ "id": checkpoint.id.0, "revision": restored.id.0 })
+                            }
+                            Err(error) => json!({ "error": error.to_string() }),
+                        }
+                    }
+                    Some(_) => json!({ "error": "checkpoint revision does not match handle" }),
+                    None => json!({ "error": "unknown checkpoint handle" }),
+                }
+            }
             _ => json!({ "error": format!("unknown tool: {name}") }),
         }
     };
@@ -793,11 +948,49 @@ fn execute_child(d: &DispatchBox, name: &str, args: Value, count_budget: bool) -
         object.insert("durationMs".to_string(), json!(duration_ms));
     }
     let ok = output.get("error").is_none();
-    if ok && matches!(name, "write" | "edit") {
-        d.state.mutation_epoch.fetch_add(1, Ordering::Relaxed);
+    let after = if tracks_revision && before.is_some() {
+        restored_revision.or_else(|| d.tracker.current_revision().ok())
+    } else {
+        None
+    };
+    let mut effects = tool_effects(name);
+    let mut paths = Vec::new();
+    if let (Some(before), Some(after)) = (before, after)
+        && before.id != after.id
+    {
+        effects.mutates_workspace = true;
+        let (added, modified, deleted) = d.tracker.delta(&before.id, &after.id).ok().map_or_else(
+            || (Vec::new(), Vec::new(), Vec::new()),
+            |delta| {
+                (
+                    string_paths(delta.added),
+                    string_paths(delta.modified),
+                    string_paths(delta.deleted),
+                )
+            },
+        );
+        paths.extend(added.iter().chain(&modified).chain(&deleted).cloned());
+        *d.state.current_revision.lock().expect("revision poisoned") = after.id.clone();
+        let source = match name {
+            "exec" => RevisionSource::Process,
+            "restore" => RevisionSource::Restore,
+            _ => RevisionSource::Tool,
+        };
+        let _ = emit_event(
+            d.state,
+            PtcEvent::WorkspaceRevisionChanged {
+                task_id: execution.task_id,
+                execution_id: execution.execution_id,
+                from: before.id,
+                to: after.id,
+                added,
+                modified,
+                deleted,
+                source,
+            },
+        );
     }
     let result_ids = result_ids(&output);
-    let paths = mutation_paths(name, &args, &output);
     let error = output
         .get("error")
         .and_then(Value::as_str)
@@ -811,31 +1004,66 @@ fn execute_child(d: &DispatchBox, name: &str, args: Value, count_budget: bool) -
     } else {
         HostCallOutcome::Error
     };
-    d.state
-        .events
-        .lock()
-        .expect("event trace poisoned")
-        .push(PtcEvent::HostCallCompleted {
+    let _ = emit_event(
+        d.state,
+        PtcEvent::HostCallCompleted {
+            task_id: execution.task_id,
+            execution_id: execution.execution_id,
             call_id,
             name: name.to_string(),
             args_hash,
-            effect: tool_effect(name),
+            effects,
             outcome,
             ok,
             duration_ms,
             result_ids,
             paths,
-        });
+        },
+    );
     output
 }
 
-fn tool_effect(name: &str) -> ToolEffect {
+fn tool_effects(name: &str) -> ToolEffects {
     match name {
-        "read" | "glob" | "grep" => ToolEffect::ReadOnly,
-        "write" | "edit" => ToolEffect::WorkspaceMutation,
-        "exec" => ToolEffect::Process,
-        _ => ToolEffect::Meta,
+        "read" | "glob" | "grep" => ToolEffects::READ,
+        "write" | "edit" => ToolEffects {
+            reads_workspace: true,
+            ..ToolEffects::default()
+        },
+        "exec" => ToolEffects::PROCESS,
+        _ => ToolEffects::META,
     }
+}
+
+fn string_paths(paths: Vec<std::path::PathBuf>) -> Vec<String> {
+    paths
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn emit_event(state: &ExecState, event: PtcEvent) -> Result<(), PtcEventSinkError> {
+    state
+        .events
+        .lock()
+        .expect("event trace poisoned")
+        .push(event.clone());
+    if let Some(error) = state
+        .sink_error
+        .lock()
+        .expect("sink error poisoned")
+        .clone()
+    {
+        return Err(error);
+    }
+    let Some(sink) = state.sink.clone() else {
+        return Ok(());
+    };
+    if let Err(error) = sink.emit(event) {
+        *state.sink_error.lock().expect("sink error poisoned") = Some(error.clone());
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn stable_args_hash(args: &Value) -> u64 {
@@ -854,16 +1082,6 @@ fn result_ids(output: &Value) -> Vec<ResultId> {
         .collect()
 }
 
-fn mutation_paths(name: &str, args: &Value, output: &Value) -> Vec<String> {
-    if !matches!(name, "write" | "edit") || output.get("error").is_some() {
-        return Vec::new();
-    }
-    args.get("path")
-        .and_then(Value::as_str)
-        .map(|path| vec![path.to_string()])
-        .unwrap_or_default()
-}
-
 fn evidence_record(d: &DispatchBox, kind: String, ok: bool, metadata: &Value) -> EvidenceRecord {
     let mut ids = Vec::new();
     collect_result_ids(d.store, metadata, &mut ids);
@@ -872,7 +1090,12 @@ fn evidence_record(d: &DispatchBox, kind: String, ok: bool, metadata: &Value) ->
     EvidenceRecord {
         kind,
         ok,
-        mutation_epoch: d.state.mutation_epoch.load(Ordering::Relaxed),
+        revision: d
+            .state
+            .current_revision
+            .lock()
+            .expect("revision poisoned")
+            .clone(),
         result_ids: ids,
         note: metadata
             .get("note")
@@ -882,6 +1105,8 @@ fn evidence_record(d: &DispatchBox, kind: String, ok: bool, metadata: &Value) ->
             .duration_since(UNIX_EPOCH)
             .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
             .unwrap_or(0),
+        task_id: d.state.execution.task_id,
+        execution_id: d.state.execution.execution_id,
     }
 }
 

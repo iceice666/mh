@@ -10,8 +10,11 @@
 //! - [`agent`]: the agent loop
 
 pub mod agent;
+pub mod checkpoint;
 pub mod context;
+pub mod identity;
 pub mod model;
 pub mod ptc;
 pub mod session;
 pub mod tools;
+pub mod workspace;

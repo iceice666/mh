@@ -363,17 +363,20 @@ fn print_session(workspace: &Path) -> Result<(), CliError> {
     let session = Session::resume(workspace)?;
     let state = session.state();
     println!("id: {}", state.id);
-    println!("status: {:?}", state.status);
+    println!(
+        "active task: {}",
+        state
+            .active_task
+            .map_or_else(|| "none".to_string(), |id| id.0.to_string())
+    );
+    println!("current revision: {}", state.current_revision.0);
     println!("events: {}", session.events().len());
-    if let Some(task) = state.task.as_deref() {
-        println!("task: {task}");
-    }
     if let Some(answer) = session
         .events()
         .iter()
         .rev()
         .find_map(|record| match &record.event {
-            SessionEvent::AssistantMessage { content } => Some(content.as_str()),
+            SessionEvent::AssistantMessage { content, .. } => Some(content.as_str()),
             _ => None,
         })
     {

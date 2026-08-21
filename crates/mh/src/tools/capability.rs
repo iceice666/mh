@@ -8,14 +8,49 @@ use std::path::{Path, PathBuf, absolute};
 
 use serde::{Deserialize, Serialize};
 
-/// Coarse side-effect class for a host tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ToolEffect {
-    ReadOnly,
-    WorkspaceMutation,
-    Process,
-    Meta,
+/// Composable side effects observed for a host tool call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolEffects {
+    #[serde(default)]
+    pub reads_workspace: bool,
+    #[serde(default)]
+    pub mutates_workspace: bool,
+    #[serde(default)]
+    pub process: bool,
+    #[serde(default)]
+    pub meta: bool,
+}
+
+impl ToolEffects {
+    pub const READ: Self = Self {
+        reads_workspace: true,
+        mutates_workspace: false,
+        process: false,
+        meta: false,
+    };
+    pub const EDIT: Self = Self {
+        reads_workspace: true,
+        mutates_workspace: true,
+        process: false,
+        meta: false,
+    };
+    pub const PROCESS: Self = Self {
+        reads_workspace: false,
+        mutates_workspace: false,
+        process: true,
+        meta: false,
+    };
+    pub const META: Self = Self {
+        reads_workspace: false,
+        mutates_workspace: false,
+        process: false,
+        meta: true,
+    };
+
+    pub const fn with_workspace_mutation(mut self) -> Self {
+        self.mutates_workspace = true;
+        self
+    }
 }
 
 /// Subprocess capability. `WorkspaceCwd` controls cwd and lifetime/output,

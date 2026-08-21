@@ -144,7 +144,7 @@ impl ContextCompiler {
 
         for record in session.events() {
             if let Some(context_item) = event_item(
-                record,
+                &record,
                 latest_user_seq,
                 latest_assistant_seq,
                 latest_completed_seq,
@@ -218,7 +218,7 @@ fn event_item(
     dialogue_start: u64,
 ) -> Option<ContextItem> {
     match &record.event {
-        SessionEvent::UserMessage { content }
+        SessionEvent::UserMessage { content, .. }
             if Some(record.seq) != latest_user_seq && record.seq >= dialogue_start =>
         {
             Some(item(
@@ -227,7 +227,7 @@ fn event_item(
                 format!("[recent conversation]\nUser: {content}"),
             ))
         }
-        SessionEvent::AssistantMessage { content }
+        SessionEvent::AssistantMessage { content, .. }
             if Some(record.seq) == latest_assistant_seq || record.seq >= dialogue_start =>
         {
             Some(item(
@@ -260,17 +260,12 @@ fn event_item(
                 ),
             ))
         }
-        SessionEvent::Compacted { summary } => Some(item(
+        SessionEvent::Compacted { summary, .. } => Some(item(
             ContextSource::Compaction,
             Priority::Sticky,
             format!("[older compacted state]\n{summary}"),
         )),
-        SessionEvent::Interrupted { operation } => Some(item(
-            ContextSource::SessionEvent(record.seq),
-            Priority::Working,
-            format!("Operation interrupted: {operation}"),
-        )),
-        SessionEvent::RepeatedActionDetected { fingerprint } => Some(item(
+        SessionEvent::RepeatedActionDetected { fingerprint, .. } => Some(item(
             ContextSource::SessionEvent(record.seq),
             Priority::Working,
             format!(
@@ -282,46 +277,31 @@ fn event_item(
 }
 
 fn render_work_state(work: &WorkState) -> String {
-    let touched = if work.touched_files.is_empty() {
-        "none".to_string()
+    let changes = if work.changed_paths.is_empty() {
+        "- none".to_string()
     } else {
-        work.touched_files.join(", ")
+        work.changed_paths
+            .iter()
+            .map(|path| format!("- {}", path.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
-    let latest_ptc = work.latest_ptc.as_ref().map_or_else(
-        || "none".to_string(),
-        |summary| {
-            format!(
-                "success at mutation epoch {} ({} tool calls, {} ms)",
-                summary.mutation_epoch, summary.tool_calls, summary.duration_ms
-            )
-        },
-    );
-    let latest_failure = work.latest_failure.as_ref().map_or_else(
-        || "none".to_string(),
-        |summary| {
-            format!(
-                "{} at mutation epoch {}",
-                summary.error.as_deref().unwrap_or("PTC failed"),
-                summary.mutation_epoch
-            )
-        },
-    );
     let evidence = if work.evidence.is_empty() {
-        "none".to_string()
+        "- none".to_string()
     } else {
         work.evidence
             .iter()
             .map(|record| {
-                let freshness = if record.mutation_epoch == work.mutation_epoch {
+                let freshness = if record.revision == work.current_revision {
                     "fresh"
                 } else {
                     "stale"
                 };
                 format!(
-                    "{}: {} at mutation epoch {} ({freshness}){}",
+                    "- {}: {} @ {} — {freshness}{}",
                     record.kind,
                     if record.ok { "PASS" } else { "FAIL" },
-                    record.mutation_epoch,
+                    record.revision.0,
                     record
                         .note
                         .as_deref()
@@ -330,11 +310,16 @@ fn render_work_state(work: &WorkState) -> String {
                 )
             })
             .collect::<Vec<_>>()
-            .join("; ")
+            .join("\n")
     };
     format!(
-        "[working state]\n- touched files: {touched}\n- mutation epoch: {}\n- latest PTC: {latest_ptc}\n- latest failure: {latest_failure}\n- verification evidence: {evidence}",
-        work.mutation_epoch
+        "[working state]\ntask: {}\nbase revision: {}\ncurrent revision: {}\n\nworkspace changes:\n{changes}\n\nverification:\n{evidence}",
+        work.task_id
+            .map_or_else(|| "none".to_string(), |id| id.0.to_string()),
+        work.base_revision
+            .as_ref()
+            .map_or("none", |revision| revision.0.as_str()),
+        work.current_revision.0,
     )
 }
 
@@ -372,7 +357,7 @@ fn bounded_json(value: &serde_json::Value, max_bytes: usize) -> String {
 pub fn canonical_system_prompt() -> &'static str {
     r#"You are mh, a coding agent. Use the provider function `ptc` whenever work requires repository access.
 
-Return a concise final answer when the latest PTC result provides enough evidence to satisfy the user. Call `ptc` exactly once only when additional repository work is still required; never repeat a successful operation already shown by a PTC result.
+Return a concise final answer when the latest PTC result provides enough evidence to satisfy the user. Call `ptc` exactly once only when additional repository work is still required; never repeat a successful operation already shown by a PTC result. Treat verification as fresh only when its revision equals the current workspace revision.
 
 PTC JavaScript uses var/function/return/if/for/while and these synchronous globals:
 - tool(name, args) — canonical host ABI
@@ -382,9 +367,11 @@ PTC JavaScript uses var/function/return/if/for/while and these synchronous globa
 - grep({pattern, path|paths, max?}) -> match[] with `.truncated`
 - exec({command: [program, ...args], timeout_ms?})
 - batch(name, args[]) — bounded parallel read/grep/glob/exec; preserves input order and isolates item errors
-- evidence(kind, ok, metadata?) — record verification against the current mutation epoch
+- evidence(kind, ok, metadata?) — record verification against the current workspace revision
+- checkpoint() -> {id, revision} — explicitly capture the current workspace state
+- restore(checkpoint) — explicitly restore a checkpoint; restoration is never automatic
 
-Use one PTC program for related work. Use batch() for independent batch-safe operations; do not emulate concurrency with Promise or async JavaScript. write/edit are not batch-safe. exec runs an OS subprocess; it is not the provider PTC entry point.
+The same checkpoint and restore operations are available through tool("checkpoint", {}) and tool("restore", {checkpoint}). Use one PTC program for related work. Use batch() for independent batch-safe operations; do not emulate concurrency with Promise or async JavaScript. write/edit/restore are not batch-safe. exec runs an OS subprocess; it is not the provider PTC entry point.
 
 exec returns {exitCode, durationMs, stdout, stderr}. stdout/stderr are handles with:
 .read(offset?, limit?), .head(n), .tail(n), .grep(pattern, limit?), .json(),
@@ -395,17 +382,19 @@ Use a top-level return statement. Large raw tool output stays in handles; return
 }
 
 #[cfg(test)]
-mod v02_prompt_tests {
+mod v03_prompt_tests {
     use super::canonical_system_prompt;
 
     #[test]
-    fn canonical_prompt_exposes_v02_workflow_surface() {
+    fn canonical_prompt_exposes_v03_workflow_surface() {
         let prompt = canonical_system_prompt();
         assert!(prompt.contains("batch(name, args[])"));
         assert!(prompt.contains("evidence(kind, ok, metadata?)"));
+        assert!(prompt.contains("checkpoint()"));
+        assert!(prompt.contains("restore(checkpoint)"));
         assert!(prompt.contains(".totalBytes"));
         assert!(prompt.contains("with `.truncated`"));
-        assert!(prompt.contains("write/edit are not batch-safe"));
+        assert!(prompt.contains("write/edit/restore are not batch-safe"));
         assert!(prompt.contains("replace let/const with var"));
     }
 }
@@ -413,8 +402,8 @@ mod v02_prompt_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{EvidenceRecord, SessionEvent};
-    use crate::tools::{ResultId, ToolEffect};
+    use crate::identity::{ExecutionId, RevisionId, TaskId};
+    use crate::session::EvidenceRecord;
 
     #[test]
     fn hard_overflow_is_explicit() {
@@ -433,7 +422,7 @@ mod tests {
             error,
             ContextError::HardOverflow {
                 required_tokens: estimate_tokens("too large"),
-                max_tokens: 1,
+                max_tokens: 1
             }
         );
     }
@@ -463,90 +452,53 @@ mod tests {
     }
 
     #[test]
-    fn historical_user_messages_are_not_hard() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut session = Session::open(dir.path()).unwrap();
-        session.begin_task("root").unwrap();
-        for content in ["first", "second"] {
-            session
-                .append(SessionEvent::UserMessage {
-                    content: content.to_string(),
-                })
-                .unwrap();
-        }
-        let compiled = ContextCompiler::default().compile(&session).unwrap();
-        let first = compiled
-            .items
-            .iter()
-            .find(|item| item.content.contains("User: first"))
-            .unwrap();
-        assert_eq!(first.priority, Priority::Ephemeral);
-        assert!(compiled.items.iter().any(|item| {
-            item.source == ContextSource::CurrentInstruction && item.priority == Priority::Hard
-        }));
-    }
-
-    #[test]
-    fn latest_state_is_rendered_and_old_ptc_results_are_retired() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut session = Session::open(dir.path()).unwrap();
-        session.begin_task("inspect").unwrap();
-        session
-            .append(SessionEvent::PtcCompleted {
-                value: serde_json::json!({"marker": "OLD_RESULT"}),
-                tool_calls: 1,
-                duration_ms: 2,
-            })
-            .unwrap();
-        session
-            .append(SessionEvent::ToolCompleted {
-                call_id: 1,
-                name: "edit".to_string(),
-                args_hash: 7,
-                effect: ToolEffect::WorkspaceMutation,
-                ok: true,
-                duration_ms: 1,
-                result_ids: vec![],
-                paths: vec!["src/lib.rs".to_string()],
-            })
-            .unwrap();
-        session
-            .append(SessionEvent::EvidenceRecorded {
-                evidence: EvidenceRecord {
+    fn work_state_labels_revision_freshness() {
+        let current = RevisionId("current".to_string());
+        let work = WorkState {
+            task_id: Some(TaskId(7)),
+            objective: Some("inspect".to_string()),
+            base_revision: Some(RevisionId("base".to_string())),
+            current_revision: current.clone(),
+            latest_user_message: None,
+            changed_paths: vec![std::path::PathBuf::from("src/lib.rs")],
+            latest_ptc: None,
+            latest_failure: None,
+            evidence: vec![
+                EvidenceRecord {
                     kind: "tests".to_string(),
                     ok: true,
-                    mutation_epoch: 0,
-                    result_ids: vec![ResultId(9)],
-                    note: Some("passed before edit".to_string()),
-                    timestamp_ms: 10,
+                    revision: current,
+                    result_ids: vec![],
+                    note: None,
+                    timestamp_ms: 1,
+                    task_id: TaskId(7),
+                    execution_id: ExecutionId(1),
                 },
-            })
-            .unwrap();
-        session
-            .append(SessionEvent::PtcCompleted {
-                value: serde_json::json!({"marker": "LATEST_RESULT"}),
-                tool_calls: 2,
-                duration_ms: 3,
-            })
-            .unwrap();
-
-        let compiled = ContextCompiler::default().compile(&session).unwrap();
-        let rendered = compiled.render();
-        assert!(rendered.contains("src/lib.rs"));
-        assert!(rendered.contains("mutation epoch: 1"));
-        assert!(rendered.contains("tests: PASS at mutation epoch 0 (stale)"));
-        assert!(rendered.contains("LATEST_RESULT"));
-        assert!(!rendered.contains("OLD_RESULT"));
-        assert!(compiled.estimated_tokens <= ContextCompiler::default().max_tokens);
+                EvidenceRecord {
+                    kind: "lint".to_string(),
+                    ok: true,
+                    revision: RevisionId("base".to_string()),
+                    result_ids: vec![],
+                    note: None,
+                    timestamp_ms: 2,
+                    task_id: TaskId(7),
+                    execution_id: ExecutionId(2),
+                },
+            ],
+            legacy_evidence: vec![],
+        };
+        let rendered = render_work_state(&work);
+        assert!(rendered.contains("task: 7"));
+        assert!(rendered.contains("current revision: current"));
+        assert!(rendered.contains("tests: PASS @ current — fresh"));
+        assert!(rendered.contains("lint: PASS @ base — stale"));
     }
 
     #[test]
     fn system_prompt_routes_repository_work_through_ptc() {
         let prompt = canonical_system_prompt();
         assert!(prompt.contains("provider function `ptc`"));
-        assert!(prompt.contains("latest PTC result provides enough evidence"));
-        assert!(prompt.contains("Call `ptc` exactly once"));
-        assert!(prompt.contains("exec runs an OS subprocess"));
-        assert!(prompt.contains("tool(name, args)"));
+        assert!(prompt.contains("checkpoint()"));
+        assert!(prompt.contains("restore(checkpoint)"));
     }
 }

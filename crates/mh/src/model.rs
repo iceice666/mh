@@ -38,10 +38,49 @@ pub enum ModelEvent {
     FunctionCall { name: String },
     ResponseCompleted { id: Option<String> },
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationStopReason {
+    UserInterrupt,
+    Superseded,
+}
+
+#[derive(Debug, Clone)]
+pub struct GenerationStop {
+    user_interrupted: Arc<AtomicBool>,
+    superseded: Arc<AtomicBool>,
+}
+
+impl GenerationStop {
+    pub fn new(user_interrupted: Arc<AtomicBool>) -> Self {
+        Self {
+            user_interrupted,
+            superseded: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn stop(&self, reason: GenerationStopReason) {
+        match reason {
+            GenerationStopReason::UserInterrupt => {
+                self.user_interrupted.store(true, Ordering::Relaxed)
+            }
+            GenerationStopReason::Superseded => self.superseded.store(true, Ordering::Relaxed),
+        }
+    }
+
+    pub fn reason(&self) -> Option<GenerationStopReason> {
+        if self.user_interrupted.load(Ordering::Relaxed) {
+            Some(GenerationStopReason::UserInterrupt)
+        } else if self.superseded.load(Ordering::Relaxed) {
+            Some(GenerationStopReason::Superseded)
+        } else {
+            None
+        }
+    }
+}
 
 #[derive(Debug)]
 pub enum ModelError {
-    Cancelled,
+    Stopped(GenerationStopReason),
     Transport(String),
     Protocol(String),
 }
@@ -49,7 +88,12 @@ pub enum ModelError {
 impl std::fmt::Display for ModelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Cancelled => write!(f, "model request cancelled"),
+            Self::Stopped(GenerationStopReason::UserInterrupt) => {
+                write!(f, "model request interrupted")
+            }
+            Self::Stopped(GenerationStopReason::Superseded) => {
+                write!(f, "model request superseded")
+            }
             Self::Transport(error) => write!(f, "model transport error: {error}"),
             Self::Protocol(error) => write!(f, "model protocol error: {error}"),
         }
@@ -62,7 +106,7 @@ pub trait Model: Send + Sync {
     fn generate(
         &self,
         context: &CompiledContext,
-        cancelled: &Arc<AtomicBool>,
+        stop: &GenerationStop,
         events: &mut dyn FnMut(ModelEvent),
     ) -> Result<ModelOutput, ModelError>;
 }
@@ -119,11 +163,11 @@ impl Model for OpenAiResponses {
     fn generate(
         &self,
         context: &CompiledContext,
-        cancelled: &Arc<AtomicBool>,
+        stop: &GenerationStop,
         events: &mut dyn FnMut(ModelEvent),
     ) -> Result<ModelOutput, ModelError> {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(ModelError::Cancelled);
+        if let Some(reason) = stop.reason() {
+            return Err(ModelError::Stopped(reason));
         }
         let endpoint = self.endpoint();
         events(ModelEvent::RequestStarted {
@@ -148,8 +192,8 @@ impl Model for OpenAiResponses {
         });
 
         let reader = loop {
-            if cancelled.load(Ordering::Relaxed) {
-                return Err(ModelError::Cancelled);
+            if let Some(reason) = stop.reason() {
+                return Err(ModelError::Stopped(reason));
             }
             match receive.recv_timeout(Duration::from_millis(50)) {
                 Ok(result) => break result?,
@@ -161,20 +205,20 @@ impl Model for OpenAiResponses {
                 }
             }
         };
-        parse_responses_stream(reader, cancelled, events)
+        parse_responses_stream(reader, stop, events)
     }
 }
 
 fn parse_responses_stream(
     reader: Box<dyn Read + Send>,
-    cancelled: &Arc<AtomicBool>,
+    stop: &GenerationStop,
     events: &mut dyn FnMut(ModelEvent),
 ) -> Result<ModelOutput, ModelError> {
     let mut stream = ResponseStreamState::default();
     let mut data_lines = Vec::new();
     for line in BufReader::new(reader).lines() {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(ModelError::Cancelled);
+        if let Some(reason) = stop.reason() {
+            return Err(ModelError::Stopped(reason));
         }
         let line = line.map_err(|error| ModelError::Transport(error.to_string()))?;
         if line.is_empty() {
@@ -416,7 +460,7 @@ fn tool_definitions() -> Value {
     json!([{
         "type": "function",
         "name": "ptc",
-        "description": "Execute one bounded synchronous JavaScript Programmatic Tool Calling program inside the workspace sandbox. The program may call tool, read, write, edit, glob, grep, exec, batch(name, args[]) for bounded parallel batch-safe host calls, and evidence(kind, ok, metadata?) to record verification. Return only compact evidence needed for the next inference; result handles expose id, length, totalBytes, truncated, kind, and bounded read/head/tail/grep/json methods.",
+        "description": "Execute one bounded synchronous JavaScript Programmatic Tool Calling program inside the workspace sandbox. The program may call tool, read, write, edit, glob, grep, exec, batch(name, args[]) for bounded parallel batch-safe host calls, evidence(kind, ok, metadata?) to record verification, checkpoint() to capture the current workspace revision, and restore(checkpoint) to explicitly restore one. Return only compact evidence needed for the next inference; result handles expose id, length, totalBytes, truncated, kind, and bounded read/head/tail/grep/json methods.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -448,10 +492,11 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[]}}\n\n",
         );
         let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = GenerationStop::new(cancelled);
         let mut events = Vec::new();
         let output = parse_responses_stream(
             Box::new(std::io::Cursor::new(stream.as_bytes().to_vec())),
-            &cancelled,
+            &stop,
             &mut |event| events.push(event),
         )
         .unwrap();
@@ -478,9 +523,10 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"output\":[]}}\n\n",
         );
         let cancelled = Arc::new(AtomicBool::new(false));
+        let stop = GenerationStop::new(cancelled);
         let output = parse_responses_stream(
             Box::new(std::io::Cursor::new(stream.as_bytes().to_vec())),
-            &cancelled,
+            &stop,
             &mut |_| {},
         )
         .unwrap();
@@ -506,6 +552,24 @@ mod tests {
         assert!(description.contains("batch(name, args[])"));
         assert!(description.contains("evidence(kind, ok, metadata?)"));
         assert!(description.contains("totalBytes"));
+    }
+
+    #[test]
+    fn generation_stop_prioritizes_user_interrupt() {
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let stop = GenerationStop::new(interrupted);
+        stop.stop(GenerationStopReason::Superseded);
+        assert_eq!(stop.reason(), Some(GenerationStopReason::Superseded));
+        stop.stop(GenerationStopReason::UserInterrupt);
+        assert_eq!(stop.reason(), Some(GenerationStopReason::UserInterrupt));
+    }
+
+    #[test]
+    fn provider_description_exposes_checkpoint_and_restore() {
+        let definitions = tool_definitions();
+        let description = definitions[0]["description"].as_str().unwrap();
+        assert!(description.contains("checkpoint()"));
+        assert!(description.contains("restore(checkpoint)"));
     }
 
     #[test]

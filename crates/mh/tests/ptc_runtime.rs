@@ -1,22 +1,67 @@
 //! PTC runtime integration tests against the real MicroQuickJS engine.
 
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
-use mh::ptc::{PtcBudget, PtcDiagnosticKind, PtcEvent, PtcOutcome, PtcRuntime};
-use mh::tools::{Capabilities, ResultStore, ToolEffect};
+use mh::checkpoint::CheckpointStore;
+use mh::identity::{ExecutionId, TaskId};
+use mh::ptc::{PtcBudget, PtcDiagnosticKind, PtcEvent, PtcExecution, PtcOutcome, PtcRuntime};
+use mh::tools::{Capabilities, ResultStore, ToolEffects};
+use mh::workspace::{WorkspaceTracker, WorkspaceTrackerImpl};
 
-fn runtime(dir: &std::path::Path) -> PtcRuntime {
+fn runtime_with_budget(dir: &std::path::Path, budget: PtcBudget) -> PtcRuntime {
+    let tracker_impl = WorkspaceTrackerImpl::open(dir).unwrap();
+    let tracker: Arc<dyn WorkspaceTracker> = Arc::new(tracker_impl);
+    let checkpoints = CheckpointStore::open(dir, tracker.clone()).unwrap();
     PtcRuntime::new(
-        Capabilities::new(dir.to_path_buf()),
+        Capabilities::new(dir),
         ResultStore::new(),
-        PtcBudget::default(),
+        budget,
+        tracker,
+        checkpoints,
     )
 }
 
+fn runtime(dir: &std::path::Path) -> PtcRuntime {
+    runtime_with_budget(dir, PtcBudget::default())
+}
+
 fn run(dir: &std::path::Path, program: &str) -> mh::ptc::PtcResult {
-    let no_cancel = Arc::new(AtomicBool::new(false));
-    runtime(dir).execute(program, &no_cancel)
+    let tracker = WorkspaceTrackerImpl::open(dir).unwrap();
+    let start_revision = tracker.current_revision().unwrap().id;
+    runtime(dir).execute(
+        program,
+        Arc::new(AtomicBool::new(false)),
+        PtcExecution {
+            task_id: TaskId(1),
+            execution_id: ExecutionId(1),
+            start_revision,
+        },
+        None,
+    )
+}
+
+fn execute(
+    rt: &PtcRuntime,
+    dir: &std::path::Path,
+    program: &str,
+    cancelled: Arc<AtomicBool>,
+) -> mh::ptc::PtcResult {
+    let start_revision = WorkspaceTrackerImpl::open(dir)
+        .unwrap()
+        .current_revision()
+        .unwrap()
+        .id;
+    rt.execute(
+        program,
+        cancelled,
+        PtcExecution {
+            task_id: TaskId(1),
+            execution_id: ExecutionId(1),
+            start_revision,
+        },
+        None,
+    )
 }
 
 #[test]
@@ -28,18 +73,20 @@ fn pure_js_evaluates() {
 }
 
 #[test]
-fn tool_read_write_roundtrip() {
+fn tool_read_write_roundtrip_preserves_trailing_newline() {
     let dir = tempfile::tempdir().unwrap();
     let r = run(
         dir.path(),
         r#"
-        write("hello.txt", "line1\nline2");
+        var expected = "line1\nline2\n";
+        write("hello.txt", expected);
         var out = read("hello.txt");
-        return out.content;
+        return {content: out.content, exact: out.content === expected};
         "#,
     );
     assert_eq!(r.outcome, PtcOutcome::Completed);
-    assert_eq!(r.value, serde_json::json!("line1\nline2"));
+    assert_eq!(r.value["content"], serde_json::json!("line1\nline2\n"));
+    assert_eq!(r.value["exact"], serde_json::json!(true));
 }
 
 #[test]
@@ -145,13 +192,13 @@ fn infinite_loop_is_interrupted() {
         instruction_limit: None,
         ..PtcBudget::default()
     };
-    let rt = PtcRuntime::new(
-        Capabilities::new(dir.path().to_path_buf()),
-        ResultStore::new(),
-        budget,
+    let rt = runtime_with_budget(dir.path(), budget);
+    let r = execute(
+        &rt,
+        dir.path(),
+        "while (true) { }",
+        Arc::new(AtomicBool::new(false)),
     );
-    let no_cancel = Arc::new(AtomicBool::new(false));
-    let r = rt.execute("while (true) { }", &no_cancel);
     assert_eq!(r.outcome, PtcOutcome::BudgetExceeded("wall time"));
 }
 
@@ -162,20 +209,17 @@ fn tool_call_budget_enforced() {
         max_tool_calls: 3,
         ..PtcBudget::default()
     };
-    let rt = PtcRuntime::new(
-        Capabilities::new(dir.path().to_path_buf()),
-        ResultStore::new(),
-        budget,
-    );
-    let no_cancel = Arc::new(AtomicBool::new(false));
-    let r = rt.execute(
+    let rt = runtime_with_budget(dir.path(), budget);
+    let r = execute(
+        &rt,
+        dir.path(),
         r#"
         for (var i = 0; i < 10; i++) {
             glob("*.none");
         }
         return "done";
         "#,
-        &no_cancel,
+        Arc::new(AtomicBool::new(false)),
     );
     assert!(matches!(r.outcome, PtcOutcome::Failed(_)));
     assert!(r.tool_calls >= 3);
@@ -281,25 +325,22 @@ fn process_budget_is_enforced() {
         max_processes: 1,
         ..PtcBudget::default()
     };
-    let rt = PtcRuntime::new(
-        Capabilities::new(dir.path().to_path_buf()),
-        ResultStore::new(),
-        budget,
-    );
-    let no_cancel = Arc::new(AtomicBool::new(false));
-    let r = rt.execute(
+    let rt = runtime_with_budget(dir.path(), budget);
+    let r = execute(
+        &rt,
+        dir.path(),
         r#"
         exec({ command: ["/bin/echo", "one"] });
         exec({ command: ["/bin/echo", "two"] });
         return "unreachable";
         "#,
-        &no_cancel,
+        Arc::new(AtomicBool::new(false)),
     );
     assert!(matches!(r.outcome, PtcOutcome::Failed(_)));
 }
 
 #[test]
-fn host_calls_are_traced_with_effects_and_mutation_epoch() {
+fn host_calls_are_traced_with_composable_effects_and_revisions() {
     let dir = tempfile::tempdir().unwrap();
     let r = run(
         dir.path(),
@@ -309,31 +350,24 @@ fn host_calls_are_traced_with_effects_and_mutation_epoch() {
         "#,
     );
     assert_eq!(r.outcome, PtcOutcome::Completed);
-    assert_eq!(r.mutation_epoch, 1);
-    assert!(matches!(
-        &r.events[0],
-        PtcEvent::HostCallStarted { call_id: 1, name, .. } if name == "write"
-    ));
-    assert!(r.events.iter().any(|event| matches!(
-        event,
-        PtcEvent::HostCallCompleted {
-            call_id: 1,
-            name,
-            effect: ToolEffect::WorkspaceMutation,
-            ok: true,
-            paths,
-            ..
-        } if name == "write" && paths == &["trace.txt".to_string()]
+    assert_ne!(r.start_revision, r.end_revision);
+    assert!(
+        matches!(&r.events[0], PtcEvent::HostCallStarted { call_id: 1, name, .. } if name == "write")
+    );
+    assert!(r.events.iter().any(|event| matches!(event,
+        PtcEvent::HostCallCompleted { call_id: 1, name, effects: ToolEffects { reads_workspace: true, mutates_workspace: true, process: false, .. }, ok: true, paths, .. }
+        if name == "write" && paths == &["trace.txt".to_string()]
+    )));
+    assert!(r.events.iter().any(|event| matches!(event,
+        PtcEvent::HostCallCompleted { call_id: 2, name, effects: ToolEffects { reads_workspace: true, mutates_workspace: false, process: false, .. }, ok: true, .. }
+        if name == "read"
     )));
     assert!(r.events.iter().any(|event| matches!(
         event,
-        PtcEvent::HostCallCompleted {
-            call_id: 2,
-            name,
-            effect: ToolEffect::ReadOnly,
-            ok: true,
+        PtcEvent::WorkspaceRevisionChanged {
+            source: mh::workspace::RevisionSource::Tool,
             ..
-        } if name == "read"
+        }
     )));
 }
 
@@ -369,16 +403,17 @@ fn batch_preserves_order_isolates_errors_and_rejects_mutation() {
 #[test]
 fn batch_exec_uses_bounded_parallel_host_workers() {
     let dir = tempfile::tempdir().unwrap();
-    let rt = PtcRuntime::new(
-        Capabilities::new(dir.path()),
-        ResultStore::new(),
+    let rt = runtime_with_budget(
+        dir.path(),
         PtcBudget {
             max_parallel_tools: 2,
             ..PtcBudget::default()
         },
     );
     let started = std::time::Instant::now();
-    let r = rt.execute(
+    let r = execute(
+        &rt,
+        dir.path(),
         r#"
         var out = batch("exec", [
             {command: ["/bin/sh", "-c", "sleep 0.15; printf 0"]},
@@ -389,7 +424,7 @@ fn batch_exec_uses_bounded_parallel_host_workers() {
         return [out[0].stdout.read().content, out[1].stdout.read().content,
                 out[2].stdout.read().content, out[3].stdout.read().content];
         "#,
-        &Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
     );
     assert_eq!(r.outcome, PtcOutcome::Completed);
     assert_eq!(r.value, serde_json::json!(["0", "1", "2", "3"]));
@@ -400,15 +435,16 @@ fn batch_exec_uses_bounded_parallel_host_workers() {
 #[test]
 fn result_handles_expose_complete_v2_metadata() {
     let dir = tempfile::tempdir().unwrap();
-    let rt = PtcRuntime::new(
-        Capabilities::new(dir.path()),
-        ResultStore::new(),
+    let rt = runtime_with_budget(
+        dir.path(),
         PtcBudget {
             max_result_bytes: 4,
             ..PtcBudget::default()
         },
     );
-    let r = rt.execute(
+    let r = execute(
+        &rt,
+        dir.path(),
         r#"
         var out = exec({command: ["/bin/sh", "-c", "printf 0123456789"]});
         return {
@@ -421,7 +457,7 @@ fn result_handles_expose_complete_v2_metadata() {
             retained: out.stdout.read().content
         };
         "#,
-        &Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
     );
     assert_eq!(r.outcome, PtcOutcome::Completed);
     assert!(r.value["durationMs"].as_u64().is_some());
@@ -451,7 +487,7 @@ fn collection_truncation_remains_visible_on_iterable_arrays() {
 }
 
 #[test]
-fn evidence_records_current_epoch_and_result_handles() {
+fn evidence_records_current_revision_and_provenance() {
     let dir = tempfile::tempdir().unwrap();
     let r = run(
         dir.path(),
@@ -472,7 +508,9 @@ fn evidence_records_current_epoch_and_result_handles() {
         .unwrap();
     assert_eq!(evidence.kind, "tests");
     assert!(evidence.ok);
-    assert_eq!(evidence.mutation_epoch, 1);
+    assert_eq!(evidence.revision, r.end_revision);
+    assert_eq!(evidence.task_id, TaskId(1));
+    assert_eq!(evidence.execution_id, ExecutionId(1));
     assert_eq!(evidence.result_ids.len(), 1);
     assert_eq!(evidence.note.as_deref(), Some("cargo test"));
 }
@@ -496,7 +534,10 @@ fn cancellation_interrupts_a_running_batch() {
         std::thread::sleep(std::time::Duration::from_millis(50));
         signal.store(true, std::sync::atomic::Ordering::Relaxed);
     });
-    let r = runtime(dir.path()).execute(
+    let rt = runtime(dir.path());
+    let r = execute(
+        &rt,
+        dir.path(),
         r#"
         batch("exec", [
             {command: ["/bin/sh", "-c", "sleep 2"]},
@@ -504,9 +545,95 @@ fn cancellation_interrupts_a_running_batch() {
         ]);
         return "unreachable";
         "#,
-        &cancelled,
+        cancelled.clone(),
     );
     trigger.join().unwrap();
     assert_eq!(r.outcome, PtcOutcome::Interrupted);
     assert!(r.duration_ms < 1_000);
+}
+
+#[derive(Default)]
+struct RecordingSink(Mutex<Vec<PtcEvent>>);
+
+impl mh::ptc::PtcEventSink for RecordingSink {
+    fn emit(&self, event: PtcEvent) -> Result<(), mh::ptc::PtcEventSinkError> {
+        self.0.lock().expect("recording sink poisoned").push(event);
+        Ok(())
+    }
+}
+
+#[test]
+fn exec_effect_is_process_plus_actual_mutation_on_any_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = run(
+        dir.path(),
+        r#"exec({command:["/bin/sh","-c","printf changed > changed.txt; exit 7"]}); return true;"#,
+    );
+    assert!(r.events.iter().any(|event| matches!(event,
+        PtcEvent::HostCallCompleted { name, effects: ToolEffects { process: true, mutates_workspace: true, .. }, .. } if name == "exec"
+    )));
+    let r = run(
+        dir.path(),
+        r#"exec({command:["/bin/sh","-c","exit 3"]}); return true;"#,
+    );
+    assert!(r.events.iter().any(|event| matches!(event,
+        PtcEvent::HostCallCompleted { name, effects: ToolEffects { process: true, mutates_workspace: false, .. }, .. } if name == "exec"
+    )));
+}
+
+#[test]
+fn live_sink_receives_events_before_execute_returns() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = runtime(dir.path());
+    let start_revision = WorkspaceTrackerImpl::open(dir.path())
+        .unwrap()
+        .current_revision()
+        .unwrap()
+        .id;
+    let sink = Arc::new(RecordingSink::default());
+    let result = rt.execute(
+        r#"write("live.txt", "yes"); return true;"#,
+        Arc::new(AtomicBool::new(false)),
+        PtcExecution {
+            task_id: TaskId(4),
+            execution_id: ExecutionId(9),
+            start_revision,
+        },
+        Some(sink.clone()),
+    );
+    assert_eq!(
+        *sink.0.lock().expect("recording sink poisoned"),
+        result.events
+    );
+    assert!(
+        sink.0
+            .lock()
+            .expect("recording sink poisoned")
+            .iter()
+            .any(|event| matches!(event, PtcEvent::WorkspaceRevisionChanged { .. }))
+    );
+}
+
+#[test]
+fn checkpoint_restore_returns_exact_revision_and_emits_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = run(
+        dir.path(),
+        r#"
+        write("state.txt", "one");
+        var cp = checkpoint();
+        write("state.txt", "two");
+        var restored = restore(cp);
+        return {cp: cp, restored: restored, content: read("state.txt").content};
+    "#,
+    );
+    assert_eq!(r.value["cp"], r.value["restored"]);
+    assert_eq!(r.value["content"], "one");
+    assert!(r.events.iter().any(|event| matches!(
+        event,
+        PtcEvent::WorkspaceRevisionChanged {
+            source: mh::workspace::RevisionSource::Restore,
+            ..
+        }
+    )));
 }

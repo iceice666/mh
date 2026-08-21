@@ -91,7 +91,7 @@ pub fn read(caps: &Capabilities, args: &Value) -> ToolOutput {
         Err(e) => return json!({ "error": format!("read {path}: {e}") }),
     };
     let text = String::from_utf8_lossy(&bytes);
-    let lines: Vec<&str> = text.lines().collect();
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let total = lines.len();
     let end = offset.saturating_add(limit).min(total);
     let slice = if offset < total {
@@ -102,17 +102,8 @@ pub fn read(caps: &Capabilities, args: &Value) -> ToolOutput {
     let mut content = String::new();
     let mut included = 0usize;
     for line in slice {
-        let separator = usize::from(!content.is_empty());
-        if content
-            .len()
-            .saturating_add(separator)
-            .saturating_add(line.len())
-            > READ_CAP
-        {
+        if content.len().saturating_add(line.len()) > READ_CAP {
             break;
-        }
-        if separator == 1 {
-            content.push('\n');
         }
         content.push_str(line);
         included += 1;
@@ -673,17 +664,17 @@ mod tests {
         );
         assert_eq!(w["ok"], true);
         let r = read(&caps, &json!({"path": "a.txt"}));
-        assert_eq!(r["content"], "hello\nworld");
+        assert_eq!(r["content"], "hello\nworld\n");
         assert_eq!(r["totalLines"], 2);
         let r2 = read(&caps, &json!({"path": "a.txt", "offset": 1, "limit": 1}));
-        assert_eq!(r2["content"], "world");
+        assert_eq!(r2["content"], "world\n");
         let e = edit(
             &caps,
             &json!({"path": "a.txt", "old": "world", "new": "mh"}),
         );
         assert_eq!(e["ok"], true);
         let r3 = read(&caps, &json!({"path": "a.txt"}));
-        assert_eq!(r3["content"], "hello\nmh");
+        assert_eq!(r3["content"], "hello\nmh\n");
     }
 
     #[test]

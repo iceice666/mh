@@ -4,6 +4,6 @@ pub mod runtime;
 pub mod wrapper;
 
 pub use runtime::{
-    HostCallOutcome, PtcBudget, PtcDiagnostic, PtcDiagnosticKind, PtcEvent, PtcOutcome, PtcResult,
-    PtcRuntime,
+    HostCallOutcome, PtcBudget, PtcDiagnostic, PtcDiagnosticKind, PtcEvent, PtcEventSink,
+    PtcEventSinkError, PtcExecution, PtcOutcome, PtcResult, PtcRuntime,
 };

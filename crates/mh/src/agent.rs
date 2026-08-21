@@ -6,13 +6,18 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::time::Duration;
 
+use crate::checkpoint::{CheckpointError, CheckpointStore};
 use crate::context::{ContextCompiler, ContextError};
-use crate::model::{Model, ModelError, ModelEvent, ModelOutput, lower};
-use crate::ptc::runtime::PtcEvent;
+use crate::model::{
+    GenerationStop, GenerationStopReason, Model, ModelError, ModelEvent, ModelOutput, lower,
+};
+use crate::ptc::runtime::{PtcEvent, PtcEventSink, PtcExecution};
 use crate::ptc::{PtcBudget, PtcOutcome, PtcRuntime};
 use crate::session::{Session, SessionError, SessionEvent};
 use crate::tools::Capabilities;
+use crate::workspace::{WorkspaceError, WorkspaceTracker, WorkspaceTrackerImpl};
 
 const REPEAT_WARNING: &str = "The previous action was repeated without changing the result. Choose a different approach instead of retrying the same PTC program.";
 
@@ -76,6 +81,8 @@ pub enum AgentEvent {
 #[derive(Debug)]
 pub enum AgentError {
     Session(SessionError),
+    Workspace(WorkspaceError),
+    Checkpoint(CheckpointError),
     Model(ModelError),
     Context(ContextError),
     Cancelled,
@@ -86,6 +93,8 @@ impl std::fmt::Display for AgentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Session(error) => error.fmt(f),
+            Self::Workspace(error) => error.fmt(f),
+            Self::Checkpoint(error) => error.fmt(f),
             Self::Model(error) => error.fmt(f),
             Self::Context(error) => error.fmt(f),
             Self::Cancelled => write!(f, "agent cancelled"),
@@ -99,6 +108,17 @@ impl std::error::Error for AgentError {}
 impl From<SessionError> for AgentError {
     fn from(value: SessionError) -> Self {
         Self::Session(value)
+    }
+}
+impl From<WorkspaceError> for AgentError {
+    fn from(value: WorkspaceError) -> Self {
+        Self::Workspace(value)
+    }
+}
+
+impl From<CheckpointError> for AgentError {
+    fn from(value: CheckpointError) -> Self {
+        Self::Checkpoint(value)
     }
 }
 
@@ -151,7 +171,6 @@ impl<M: Model> Agent<M> {
     ) -> Result<String, AgentError> {
         self.run_task_controlled(workspace, task, cancelled, None, events)
     }
-
     pub fn run_task_controlled(
         &self,
         workspace: &Path,
@@ -161,8 +180,9 @@ impl<M: Model> Agent<M> {
         events: &mut dyn FnMut(AgentEvent),
     ) -> Result<String, AgentError> {
         let mut session = Session::open(workspace)?;
-        session.begin_task(task)?;
+        let task_id = session.begin_task(task)?;
         session.append(SessionEvent::UserMessage {
+            task_id,
             content: task.to_string(),
         })?;
         self.run_session(&mut session, cancelled, controls, events)
@@ -214,7 +234,6 @@ impl<M: Model> Agent<M> {
     ) -> Result<String, AgentError> {
         self.send_message_controlled(workspace, message, cancelled, None, events)
     }
-
     pub fn send_message_controlled(
         &self,
         workspace: &Path,
@@ -224,8 +243,9 @@ impl<M: Model> Agent<M> {
         events: &mut dyn FnMut(AgentEvent),
     ) -> Result<String, AgentError> {
         let mut session = Session::open(workspace)?;
-        session.begin_task(message)?;
+        let task_id = session.begin_task(message)?;
         session.append(SessionEvent::UserMessage {
+            task_id,
             content: message.to_string(),
         })?;
         self.run_session(&mut session, cancelled, controls, events)
@@ -238,47 +258,51 @@ impl<M: Model> Agent<M> {
         controls: Option<&Receiver<AgentControl>>,
         events: &mut dyn FnMut(AgentEvent),
     ) -> Result<String, AgentError> {
-        let store = session.result_store()?;
+        let tracker_impl = WorkspaceTrackerImpl::open(&session.state().workspace)?;
+        let tracker: Arc<dyn WorkspaceTracker> = Arc::new(tracker_impl);
+        let checkpoints = CheckpointStore::open(&session.state().workspace, tracker.clone())?;
         let runtime = PtcRuntime::new(
             Capabilities::new(session.state().workspace.clone()),
-            store,
+            session.result_store()?,
             self.config.ptc_budget.clone(),
+            tracker,
+            checkpoints,
         );
         let mut repeated = RepeatState::default();
 
         for _turn in 0..self.config.max_turns {
-            apply_controls(session, cancelled, controls, events, &mut repeated)?;
-            check_cancelled(session, cancelled)?;
-
-            let context = self.compiler.compile(session)?;
-            session.append(SessionEvent::ModelStarted)?;
-            let output = match self.model.generate(&context, cancelled, &mut |event| {
-                events(AgentEvent::Model(event))
-            }) {
-                Ok(output) => output,
-                Err(ModelError::Cancelled) => {
-                    interrupt(session, "model")?;
-                    return Err(AgentError::Cancelled);
-                }
-                Err(error) => return Err(error.into()),
-            };
-            session.append(SessionEvent::ModelCompleted {
-                output_kind: output_kind(&output).to_string(),
+            let task_id = session.state().active_task.ok_or_else(|| {
+                SessionError::State("cannot run an agent without an active task".to_string())
             })?;
-
-            // A control queued during inference invalidates all unexecuted output,
-            // including a nominally final text response.
-            if apply_controls(session, cancelled, controls, events, &mut repeated)? {
-                continue;
+            let steering = drain_controls(cancelled, controls, events)?;
+            if !steering.is_empty() {
+                apply_steering(session, task_id, steering, events, &mut repeated)?;
+                session.reconcile_workspace()?;
             }
             check_cancelled(session, cancelled)?;
-
+            session.reconcile_workspace()?;
+            let context = self.compiler.compile(session)?;
+            session.append(SessionEvent::ModelStarted { task_id })?;
+            let (output, steering) =
+                self.generate_controlled(&context, cancelled, controls, events)?;
+            if !steering.is_empty() {
+                session.append(SessionEvent::ModelSuperseded { task_id })?;
+                apply_steering(session, task_id, steering, events, &mut repeated)?;
+                session.reconcile_workspace()?;
+                continue;
+            }
+            session.append(SessionEvent::ModelCompleted {
+                task_id,
+                output_kind: output_kind(&output).to_string(),
+            })?;
+            check_cancelled(session, cancelled)?;
             match output {
                 ModelOutput::Text(text) => {
                     session.append(SessionEvent::AssistantMessage {
+                        task_id,
                         content: text.clone(),
                     })?;
-                    session.mark_completed()?;
+                    session.complete_task(Some(text.clone()))?;
                     return Ok(text);
                 }
                 executable => {
@@ -291,23 +315,33 @@ impl<M: Model> Agent<M> {
                             .fingerprint
                             .clone()
                             .unwrap_or_else(|| fingerprint_text(&normalized));
-                        record_repeat(session, events, fingerprint)?;
+                        record_repeat(session, task_id, events, fingerprint)?;
                         continue;
                     }
-
-                    // Final safe point immediately before execution.
-                    if apply_controls(session, cancelled, controls, events, &mut repeated)? {
+                    let steering = drain_controls(cancelled, controls, events)?;
+                    if !steering.is_empty() {
+                        apply_steering(session, task_id, steering, events, &mut repeated)?;
+                        session.reconcile_workspace()?;
                         continue;
                     }
                     check_cancelled(session, cancelled)?;
-
+                    let execution_id = session.begin_execution()?;
+                    let start_revision = session.state().current_revision.clone();
                     session.append(SessionEvent::PtcStarted {
+                        task_id,
+                        execution_id,
                         source: source.clone(),
+                        start_revision: start_revision.clone(),
                     })?;
                     events(AgentEvent::PtcStarted);
-                    let epoch = session.work_state().mutation_epoch;
-                    let result = runtime.execute_at_epoch(&source, cancelled, epoch);
-                    translate_ptc_events(session, &result.events, events)?;
+                    let execution = PtcExecution {
+                        task_id,
+                        execution_id,
+                        start_revision,
+                    };
+                    let sink: Arc<dyn PtcEventSink> = Arc::new(session.ptc_event_sink());
+                    let result = runtime.execute(&source, cancelled.clone(), execution, Some(sink));
+                    translate_ptc_events(&result.events, events);
                     events(AgentEvent::ToolCompleted {
                         outcome: format!("{:?}", result.outcome),
                         tool_calls: result.tool_calls,
@@ -315,10 +349,9 @@ impl<M: Model> Agent<M> {
                     });
                     session.append_ptc_result(&result)?;
                     if result.outcome == PtcOutcome::Interrupted {
-                        session.mark_interrupted()?;
+                        session.interrupt_task()?;
                         return Err(AgentError::Cancelled);
                     }
-
                     let fingerprint =
                         action_fingerprint(&normalized, &result.outcome, &result.value);
                     if repeated.normalized_source.as_deref() == Some(&normalized)
@@ -331,16 +364,84 @@ impl<M: Model> Agent<M> {
                         repeated.identical_executions = 1;
                     }
                     if repeated.identical_executions == 2 {
-                        record_repeat(session, events, fingerprint)?;
+                        record_repeat(session, task_id, events, fingerprint)?;
                     }
-
-                    // Steering received after execution began is applied only now.
-                    apply_controls(session, cancelled, controls, events, &mut repeated)?;
-                    check_cancelled(session, cancelled)?;
                 }
             }
         }
         Err(AgentError::TurnLimit(self.config.max_turns))
+    }
+
+    fn generate_controlled(
+        &self,
+        context: &crate::context::CompiledContext,
+        cancelled: &Arc<AtomicBool>,
+        controls: Option<&Receiver<AgentControl>>,
+        events: &mut dyn FnMut(AgentEvent),
+    ) -> Result<(ModelOutput, Vec<String>), AgentError> {
+        let stop = GenerationStop::new(cancelled.clone());
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let mut steering = Vec::new();
+        std::thread::scope(|scope| {
+            let model_stop = stop.clone();
+            scope.spawn(move || {
+                let result = self.model.generate(context, &model_stop, &mut |event| {
+                    let _ = event_tx.send(event);
+                });
+                let _ = result_tx.send(result);
+            });
+            loop {
+                while let Ok(event) = event_rx.try_recv() {
+                    events(AgentEvent::Model(event));
+                }
+                if let Some(receiver) = controls {
+                    loop {
+                        match receiver.try_recv() {
+                            Ok(AgentControl::Steer(content)) => {
+                                events(AgentEvent::SteeringQueued {
+                                    content: content.clone(),
+                                });
+                                steering.push(content);
+                                stop.stop(GenerationStopReason::Superseded);
+                            }
+                            Ok(AgentControl::Interrupt) => {
+                                stop.stop(GenerationStopReason::UserInterrupt)
+                            }
+                            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                        }
+                    }
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    stop.stop(GenerationStopReason::UserInterrupt);
+                }
+                match result_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(result) => {
+                        while let Ok(event) = event_rx.try_recv() {
+                            events(AgentEvent::Model(event));
+                        }
+                        return match result {
+                            Ok(output) => Ok((output, steering)),
+                            Err(ModelError::Stopped(GenerationStopReason::Superseded))
+                                if !steering.is_empty() =>
+                            {
+                                Ok((ModelOutput::Text(String::new()), steering))
+                            }
+                            Err(ModelError::Stopped(GenerationStopReason::UserInterrupt)) => {
+                                Err(AgentError::Cancelled)
+                            }
+                            Err(error) => Err(error.into()),
+                        };
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(AgentError::Model(ModelError::Protocol(
+                            "model worker stopped unexpectedly".to_string(),
+                        )));
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -351,50 +452,53 @@ struct RepeatState {
     identical_executions: usize,
 }
 
-fn apply_controls(
-    session: &mut Session,
+fn drain_controls(
     cancelled: &Arc<AtomicBool>,
     controls: Option<&Receiver<AgentControl>>,
     events: &mut dyn FnMut(AgentEvent),
-    repeated: &mut RepeatState,
-) -> Result<bool, AgentError> {
+) -> Result<Vec<String>, AgentError> {
     let Some(controls) = controls else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     let mut steering = Vec::new();
     loop {
         match controls.try_recv() {
-            Ok(AgentControl::Steer(content)) => steering.push(content),
+            Ok(AgentControl::Steer(content)) => {
+                events(AgentEvent::SteeringQueued {
+                    content: content.clone(),
+                });
+                steering.push(content);
+            }
             Ok(AgentControl::Interrupt) => cancelled.store(true, Ordering::Relaxed),
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
         }
     }
-    let applied = !steering.is_empty();
-    for content in &steering {
+    Ok(steering)
+}
+
+fn apply_steering(
+    session: &mut Session,
+    task_id: crate::identity::TaskId,
+    steering: Vec<String>,
+    events: &mut dyn FnMut(AgentEvent),
+    repeated: &mut RepeatState,
+) -> Result<(), AgentError> {
+    for content in steering {
         session.append(SessionEvent::SteeringQueued {
+            task_id,
             content: content.clone(),
         })?;
-        events(AgentEvent::SteeringQueued {
-            content: content.clone(),
-        });
-    }
-    for content in steering {
         session.append(SessionEvent::SteeringApplied {
+            task_id,
             content: content.clone(),
         })?;
         events(AgentEvent::SteeringApplied { content });
     }
-    if applied {
-        *repeated = RepeatState::default();
-    }
-    Ok(applied)
+    *repeated = RepeatState::default();
+    Ok(())
 }
 
-fn translate_ptc_events(
-    session: &mut Session,
-    ptc_events: &[PtcEvent],
-    events: &mut dyn FnMut(AgentEvent),
-) -> Result<(), AgentError> {
+fn translate_ptc_events(ptc_events: &[PtcEvent], events: &mut dyn FnMut(AgentEvent)) {
     for event in ptc_events {
         match event {
             PtcEvent::HostCallStarted { call_id, name, .. } => {
@@ -406,67 +510,41 @@ fn translate_ptc_events(
             PtcEvent::HostCallCompleted {
                 call_id,
                 name,
-                args_hash,
-                effect,
                 ok,
                 duration_ms,
-                result_ids,
-                paths,
                 ..
-            } => {
-                session.append(SessionEvent::ToolCompleted {
-                    call_id: *call_id,
-                    name: name.clone(),
-                    args_hash: *args_hash,
-                    effect: *effect,
-                    ok: *ok,
-                    duration_ms: *duration_ms,
-                    result_ids: result_ids.clone(),
-                    paths: paths.clone(),
-                })?;
-                events(AgentEvent::PtcHostCallCompleted {
-                    call_id: *call_id,
-                    name: name.clone(),
-                    ok: *ok,
-                    duration_ms: *duration_ms,
-                });
-            }
-            PtcEvent::EvidenceRecorded { evidence } => {
-                session.append(SessionEvent::EvidenceRecorded {
-                    evidence: evidence.clone(),
-                })?;
-                events(AgentEvent::EvidenceRecorded {
-                    kind: evidence.kind.clone(),
-                    ok: evidence.ok,
-                });
-            }
+            } => events(AgentEvent::PtcHostCallCompleted {
+                call_id: *call_id,
+                name: name.clone(),
+                ok: *ok,
+                duration_ms: *duration_ms,
+            }),
+            PtcEvent::EvidenceRecorded { evidence, .. } => events(AgentEvent::EvidenceRecorded {
+                kind: evidence.kind.clone(),
+                ok: evidence.ok,
+            }),
+            PtcEvent::WorkspaceRevisionChanged { .. } => {}
         }
     }
-    Ok(())
 }
 
 fn check_cancelled(session: &mut Session, cancelled: &Arc<AtomicBool>) -> Result<(), AgentError> {
     if cancelled.load(Ordering::Relaxed) {
-        interrupt(session, "agent")?;
+        session.interrupt_task()?;
         Err(AgentError::Cancelled)
     } else {
         Ok(())
     }
 }
 
-fn interrupt(session: &mut Session, operation: &str) -> Result<(), SessionError> {
-    session.append(SessionEvent::Interrupted {
-        operation: operation.to_string(),
-    })?;
-    session.mark_interrupted()
-}
-
 fn record_repeat(
     session: &mut Session,
+    task_id: crate::identity::TaskId,
     events: &mut dyn FnMut(AgentEvent),
     fingerprint: String,
 ) -> Result<(), AgentError> {
     session.append(SessionEvent::RepeatedActionDetected {
+        task_id,
         fingerprint: fingerprint.clone(),
     })?;
     events(AgentEvent::RepeatedActionDetected { fingerprint });
@@ -525,7 +603,7 @@ mod tests {
         fn generate(
             &self,
             _context: &CompiledContext,
-            _cancelled: &Arc<AtomicBool>,
+            _stop: &GenerationStop,
             _events: &mut dyn FnMut(ModelEvent),
         ) -> Result<ModelOutput, ModelError> {
             self.outputs
@@ -544,16 +622,24 @@ mod tests {
         fn generate(
             &self,
             _context: &CompiledContext,
-            _cancelled: &Arc<AtomicBool>,
+            stop: &GenerationStop,
             _events: &mut dyn FnMut(ModelEvent),
         ) -> Result<ModelOutput, ModelError> {
-            self.barrier.wait();
-            self.barrier.wait();
-            self.outputs
+            let output = self
+                .outputs
                 .lock()
                 .unwrap()
                 .pop()
-                .ok_or_else(|| ModelError::Protocol("script exhausted".to_string()))
+                .ok_or_else(|| ModelError::Protocol("script exhausted".to_string()))?;
+            if matches!(output, ModelOutput::Program { .. }) {
+                self.barrier.wait();
+                while stop.reason().is_none() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(ModelError::Stopped(stop.reason().unwrap()))
+            } else {
+                Ok(output)
+            }
         }
     }
 
@@ -612,9 +698,7 @@ mod tests {
             });
             barrier.wait();
             tx.send(AgentControl::Steer("do not write".into())).unwrap();
-            barrier.wait();
-            barrier.wait();
-            barrier.wait();
+
             assert_eq!(handle.join().unwrap().unwrap(), "done");
         });
         assert!(!dir.path().join("stale.txt").exists());
