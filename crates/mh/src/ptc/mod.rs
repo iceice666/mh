@@ -3,4 +3,7 @@
 pub mod runtime;
 pub mod wrapper;
 
-pub use runtime::{PtcBudget, PtcOutcome, PtcResult, PtcRuntime};
+pub use runtime::{
+    HostCallOutcome, PtcBudget, PtcDiagnostic, PtcDiagnosticKind, PtcEvent, PtcOutcome, PtcResult,
+    PtcRuntime,
+};

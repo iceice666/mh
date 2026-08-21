@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use super::capability::{Capabilities, SandboxError};
+use super::capability::{Capabilities, ProcessPolicy, SandboxError};
 use super::store::{ResultId, ResultStore};
 
 /// Upper bound on a single read() result entering JS/context.
@@ -79,7 +79,7 @@ pub fn read(caps: &Capabilities, args: &Value) -> ToolOutput {
     let Some(path) = args.get("path").and_then(Value::as_str) else {
         return json!({ "error": "read: missing 'path'" });
     };
-    let abs = match caps.resolve(path) {
+    let abs = match caps.resolve_existing_read(path) {
         Ok(p) => p,
         Err(e) => return e.to_json(),
     };
@@ -140,7 +140,7 @@ pub fn write(caps: &Capabilities, args: &Value) -> ToolOutput {
     let Some(content) = args.get("content").and_then(Value::as_str) else {
         return json!({ "error": "write: missing 'content'" });
     };
-    let abs = match caps.resolve(path) {
+    let abs = match caps.resolve_for_write(path) {
         Ok(p) => p,
         Err(e) => return e.to_json(),
     };
@@ -171,7 +171,7 @@ pub fn edit(caps: &Capabilities, args: &Value) -> ToolOutput {
     let Some(new) = args.get("new").and_then(Value::as_str) else {
         return json!({ "error": "edit: missing 'new'" });
     };
-    let abs = match caps.resolve(path) {
+    let abs = match caps.resolve_for_write(path) {
         Ok(p) => p,
         Err(e) => return e.to_json(),
     };
@@ -201,7 +201,7 @@ pub fn edit(caps: &Capabilities, args: &Value) -> ToolOutput {
 // ---------------------------------------------------------------------------
 
 /// `glob { pattern }` — shell-style matching (`**` supported) under
-/// the workspace. Returns `{ files: [...] }`, sorted, capped.
+/// the workspace. Returns `{ files: [...], truncated }`, sorted, capped.
 pub fn glob(caps: &Capabilities, args: &Value) -> ToolOutput {
     let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
         return json!({ "error": "glob: missing 'pattern'" });
@@ -212,6 +212,7 @@ pub fn glob(caps: &Capabilities, args: &Value) -> ToolOutput {
     let root = Path::new(&caps.workspace);
     let matcher = GlobPattern::new(pattern);
     let mut hits = Vec::new();
+    let mut truncated = false;
     let mut queue = VecDeque::new();
     queue.push_back(root.to_path_buf());
     while let Some(dir) = queue.pop_front() {
@@ -233,16 +234,18 @@ pub fn glob(caps: &Capabilities, args: &Value) -> ToolOutput {
             } else if matcher.matches(&rel) {
                 hits.push(rel);
             }
-            if hits.len() >= 10_000 {
+            if hits.len() > 10_000 {
+                truncated = true;
                 break;
             }
         }
-        if hits.len() >= 10_000 {
+        if truncated {
             break;
         }
     }
     hits.sort();
-    json!({ "files": hits })
+    hits.truncate(10_000);
+    json!({ "files": hits, "truncated": truncated })
 }
 
 /// Minimal `**`/`*`/`?` glob matcher over `/`-separated paths.
@@ -364,7 +367,7 @@ pub fn grep(caps: &Capabilities, args: &Value) -> ToolOutput {
     // whole workspace.
     let mut files: Vec<String> = Vec::new();
     let collect = |p: &str, files: &mut Vec<String>| {
-        match caps.resolve_existing(p) {
+        match caps.resolve_existing_read(p) {
             Ok(abs) => {
                 if abs.is_dir() {
                     walk_files(&abs, files);
@@ -391,7 +394,7 @@ pub fn grep(caps: &Capabilities, args: &Value) -> ToolOutput {
     let mut matches = Vec::new();
     let mut truncated = false;
     'outer: for f in &files {
-        let Ok(abs) = caps.resolve_existing(f) else {
+        let Ok(abs) = caps.resolve_existing_read(f) else {
             continue;
         };
         let Ok(bytes) = std::fs::read(&abs) else {
@@ -422,9 +425,12 @@ fn walk_files(dir: &Path, out: &mut Vec<String>) {
         if name.starts_with('.') {
             continue;
         }
-        if p.is_dir() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
             subdirs.push(p);
-        } else {
+        } else if file_type.is_file() {
             out.push(p.to_string_lossy().into_owned());
         }
     }
@@ -462,7 +468,7 @@ pub fn exec(
     if argv.is_empty() {
         return json!({ "error": "exec: empty 'command'" });
     }
-    if !caps.exec {
+    if caps.process == ProcessPolicy::Disabled {
         return json!({ "error": "exec: disabled by policy" });
     }
     let timeout_ms = args
@@ -471,14 +477,16 @@ pub fn exec(
         .unwrap_or(DEFAULT_TIMEOUT_MS);
     let timeout = Duration::from_millis(timeout_ms.max(1));
 
-    let mut child = match Command::new(&argv[0])
+    let mut command = Command::new(&argv[0]);
+    command
         .args(&argv[1..])
         .current_dir(&caps.workspace)
+        .env_remove("MH_API_KEY")
+        .env_remove("OPENAI_API_KEY")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => return json!({ "error": format!("exec {}: {e}", argv[0]) }),
     };
@@ -520,37 +528,39 @@ pub fn exec(
             Err(_) => break None,
         }
     };
-    let (stdout, stdout_truncated) = stdout_reader
+    let (stdout, stdout_total) = stdout_reader
         .and_then(|reader| reader.join().ok())
         .unwrap_or_default();
-    let (stderr, stderr_truncated) = stderr_reader
+    let (stderr, stderr_total) = stderr_reader
         .and_then(|reader| reader.join().ok())
         .unwrap_or_default();
 
+    let duration_ms = start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let exit_code = status
         .and_then(|status| status.code())
         .map(i64::from)
         .unwrap_or(-1);
-    let out_res = store.put(stdout, capture_cap);
-    let err_res = store.put(stderr, capture_cap);
+    let out_res = store.put_with_total(stdout, stdout_total, capture_cap);
+    let err_res = store.put_with_total(stderr, stderr_total, capture_cap);
     json!({
         "exitCode": exit_code,
+        "durationMs": duration_ms,
         "stdoutId": out_res.id.0,
         "stderrId": err_res.id.0,
-        "stdoutTruncated": stdout_truncated || out_res.truncated,
-        "stderrTruncated": stderr_truncated || err_res.truncated,
+        "stdoutTruncated": out_res.truncated,
+        "stderrTruncated": err_res.truncated,
     })
 }
 
-fn read_bounded_pipe(reader: &mut impl std::io::Read, cap: usize) -> (Vec<u8>, bool) {
+fn read_bounded_pipe(reader: &mut impl std::io::Read, cap: usize) -> (Vec<u8>, u64) {
     let mut tail = VecDeque::with_capacity(cap.min(64 * 1024));
     let mut buffer = [0u8; 8192];
-    let mut total = 0usize;
+    let mut total = 0u64;
     while let Ok(read) = reader.read(&mut buffer) {
         if read == 0 {
             break;
         }
-        total = total.saturating_add(read);
+        total = total.saturating_add(read as u64);
         if cap == 0 {
             continue;
         }
@@ -561,7 +571,7 @@ fn read_bounded_pipe(reader: &mut impl std::io::Read, cap: usize) -> (Vec<u8>, b
             tail.push_back(*byte);
         }
     }
-    (tail.into_iter().collect(), total > cap)
+    (tail.into_iter().collect(), total)
 }
 
 /// Reads a range of lines from a stored result.
@@ -624,7 +634,19 @@ pub fn handle_json(store: &ResultStore, id: u64) -> Value {
 }
 
 pub fn handle_length(store: &ResultStore, id: u64) -> Option<usize> {
-    store.get(ResultId(id)).map(|result| result.data.len())
+    store.metadata(ResultId(id)).map(|metadata| metadata.length)
+}
+
+pub fn handle_total_bytes(store: &ResultStore, id: u64) -> Option<u64> {
+    store
+        .metadata(ResultId(id))
+        .map(|metadata| metadata.total_bytes)
+}
+
+pub fn handle_truncated(store: &ResultStore, id: u64) -> Option<bool> {
+    store
+        .metadata(ResultId(id))
+        .map(|metadata| metadata.truncated)
 }
 
 #[allow(dead_code)]
@@ -673,6 +695,17 @@ mod tests {
     }
 
     #[test]
+    fn glob_reports_truncation_envelope() {
+        let (caps, _d) = caps();
+        for index in 0..=10_000 {
+            std::fs::write(caps.workspace.join(format!("{index:05}.txt")), "x").unwrap();
+        }
+        let result = glob(&caps, &json!({"pattern": "*.txt"}));
+        assert_eq!(result["files"].as_array().unwrap().len(), 10_000);
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
     fn glob_finds_nested_files() {
         let (caps, _d) = caps();
         std::fs::create_dir_all(caps.workspace.join("src/deep")).unwrap();
@@ -684,6 +717,7 @@ mod tests {
         assert!(files.contains(&json!("src/a.rs")));
         assert!(files.contains(&json!("src/deep/b.rs")));
         assert!(!files.contains(&json!("src/c.txt")));
+        assert_eq!(g["truncated"], false);
     }
 
     #[test]
@@ -713,6 +747,7 @@ mod tests {
             &no_cancel,
         );
         assert_eq!(r["exitCode"], 3);
+        assert!(r["durationMs"].as_u64().is_some());
         let out = store
             .text(ResultId(r["stdoutId"].as_u64().unwrap()))
             .unwrap();
@@ -723,6 +758,59 @@ mod tests {
         assert_eq!(err.trim(), "err");
     }
 
+    #[test]
+    fn exec_enforces_policy_scrubs_secrets_and_reports_metadata() {
+        const CHILD_MARKER: &str = "MH_EXEC_SCRUB_TEST_CHILD";
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let (caps, _d) = caps();
+            let store = ResultStore::new();
+            let result = exec(
+                &caps,
+                &store,
+                &json!({"command": ["/bin/sh", "-c", "printf 0123456789; test -z \"$MH_API_KEY\" && test -z \"$OPENAI_API_KEY\" && printf unset:unset err >&2"]}),
+                4,
+                &|| false,
+            );
+            assert_eq!(result["exitCode"], 0);
+            assert!(result["durationMs"].as_u64().is_some());
+            let stdout = store
+                .get(ResultId(result["stdoutId"].as_u64().unwrap()))
+                .unwrap();
+            assert_eq!(stdout.data, b"6789");
+            assert_eq!(stdout.total_bytes, 10);
+            assert!(stdout.truncated);
+            let stderr = store
+                .get(ResultId(result["stderrId"].as_u64().unwrap()))
+                .unwrap();
+            assert!(String::from_utf8_lossy(&stderr.data).ends_with("nset"));
+            assert_eq!(stderr.total_bytes, 11);
+            assert!(stderr.truncated);
+            return;
+        }
+
+        let (mut caps, _d) = caps();
+        caps.process = ProcessPolicy::Disabled;
+        let disabled = exec(
+            &caps,
+            &ResultStore::new(),
+            &json!({"command": ["/bin/echo", "no"]}),
+            EXEC_CAP,
+            &|| false,
+        );
+        assert!(disabled["error"].as_str().unwrap().contains("disabled"));
+
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tools::fs_tools::tests::exec_enforces_policy_scrubs_secrets_and_reports_metadata",
+            ])
+            .env(CHILD_MARKER, "1")
+            .env("MH_API_KEY", "must-not-leak")
+            .env("OPENAI_API_KEY", "must-not-leak")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
     #[test]
     fn exec_drains_large_output_without_deadlock_and_caps_tail() {
         let (caps, _d) = caps();

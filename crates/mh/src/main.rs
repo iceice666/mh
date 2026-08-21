@@ -1,10 +1,13 @@
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
-use mh::agent::{Agent, AgentConfig, AgentError, AgentEvent};
+use mh::agent::{Agent, AgentConfig, AgentControl, AgentError, AgentEvent};
 use mh::model::{ModelEvent, OpenAiResponses};
 use mh::session::{Session, SessionError, SessionEvent};
 
@@ -115,48 +118,166 @@ fn new_agent() -> Result<Agent<OpenAiResponses>, CliError> {
 
 fn repl(workspace: &Path, cancelled: &Arc<AtomicBool>) -> Result<(), CliError> {
     println!("mh — PTC coding agent. Type /help for commands.");
-    let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
+    let (input_tx, input_rx) = mpsc::channel();
+    std::thread::spawn(move || read_stdin(input_tx));
+    let (event_tx, event_rx) = mpsc::channel();
+    let mut worker: Option<AgentWorker> = None;
     let mut printer = EventPrinter {
         reasoning_open: false,
     };
-    for line in stdin.lock().lines() {
-        write!(stdout, "mh> ")?;
-        stdout.flush()?;
-        let line = line?;
-        let message = line.trim();
-        if message.is_empty() {
-            continue;
+    print_prompt()?;
+
+    loop {
+        drain_worker_events(&event_rx, &mut printer);
+        if worker
+            .as_ref()
+            .is_some_and(|worker| worker.handle.is_finished())
+        {
+            let finished = worker.take().expect("worker was present");
+            match finished.handle.join() {
+                Ok(Ok(answer)) => println!("{answer}"),
+                Ok(Err(AgentError::Cancelled)) => eprintln!("[agent] cancelled"),
+                Ok(Err(error)) => eprintln!("[agent] {error}"),
+                Err(_) => eprintln!("[agent] worker panicked"),
+            }
+            drain_worker_events(&event_rx, &mut printer);
+            print_prompt()?;
         }
-        match message {
-            "/quit" | "/exit" => return Ok(()),
-            "/help" => {
-                writeln!(stdout, "/resume  resume the workspace session")?;
-                writeln!(stdout, "/session show session state")?;
-                writeln!(stdout, "/quit    exit")?;
+
+        match input_rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(Ok(line)) => {
+                let message = line.trim();
+                if message.is_empty() {
+                    print_prompt()?;
+                    continue;
+                }
+                if let Some(active) = worker.as_ref() {
+                    match message {
+                        "/quit" | "/exit" => {
+                            let _ = active.controls.send(AgentControl::Interrupt);
+                            cancelled.store(true, Ordering::Relaxed);
+                            let active = worker.take().expect("worker was present");
+                            let _ = active.handle.join();
+                            return Ok(());
+                        }
+                        "/help" => print_repl_help(),
+                        _ => {
+                            active
+                                .controls
+                                .send(AgentControl::Steer(message.to_string()))
+                                .map_err(|_| {
+                                    CliError::Model("agent control channel closed".to_string())
+                                })?;
+                            eprintln!("[steering] queued");
+                        }
+                    }
+                    print_prompt()?;
+                    continue;
+                }
+
+                match message {
+                    "/quit" | "/exit" => return Ok(()),
+                    "/help" => print_repl_help(),
+                    "/session" => print_session(workspace)?,
+                    "/resume" => {
+                        worker = Some(spawn_agent_worker(
+                            workspace.to_path_buf(),
+                            None,
+                            true,
+                            cancelled.clone(),
+                            event_tx.clone(),
+                        )?)
+                    }
+                    _ => {
+                        worker = Some(spawn_agent_worker(
+                            workspace.to_path_buf(),
+                            Some(message.to_string()),
+                            false,
+                            cancelled.clone(),
+                            event_tx.clone(),
+                        )?)
+                    }
+                }
+                print_prompt()?;
             }
-            "/session" => print_session(workspace)?,
-            "/resume" => {
-                cancelled.store(false, Ordering::Relaxed);
-                let answer =
-                    new_agent()?.resume_with_events(workspace, cancelled, &mut |event| {
-                        printer.print(event)
-                    })?;
-                writeln!(stdout, "{answer}")?;
-            }
-            _ => {
-                cancelled.store(false, Ordering::Relaxed);
-                let answer = new_agent()?.send_message_with_events(
-                    workspace,
-                    message,
-                    cancelled,
-                    &mut |event| printer.print(event),
-                )?;
-                writeln!(stdout, "{answer}")?;
+            Ok(Err(error)) => return Err(error.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(active) = worker.take() {
+                    let _ = active.controls.send(AgentControl::Interrupt);
+                    cancelled.store(true, Ordering::Relaxed);
+                    let _ = active.handle.join();
+                }
+                return Ok(());
             }
         }
     }
-    Ok(())
+}
+
+struct AgentWorker {
+    controls: Sender<AgentControl>,
+    handle: JoinHandle<Result<String, AgentError>>,
+}
+
+fn spawn_agent_worker(
+    workspace: PathBuf,
+    message: Option<String>,
+    resume: bool,
+    cancelled: Arc<AtomicBool>,
+    event_tx: Sender<AgentEvent>,
+) -> Result<AgentWorker, CliError> {
+    let agent = new_agent()?;
+    cancelled.store(false, Ordering::Relaxed);
+    let (control_tx, control_rx) = mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let mut emit = |event| {
+            let _ = event_tx.send(event);
+        };
+        if resume {
+            agent.resume_controlled(&workspace, &cancelled, Some(&control_rx), &mut emit)
+        } else {
+            agent.send_message_controlled(
+                &workspace,
+                message.as_deref().expect("message task"),
+                &cancelled,
+                Some(&control_rx),
+                &mut emit,
+            )
+        }
+    });
+    Ok(AgentWorker {
+        controls: control_tx,
+        handle,
+    })
+}
+
+fn read_stdin(sender: Sender<Result<String, io::Error>>) {
+    for line in io::stdin().lock().lines() {
+        let done = line.is_err();
+        if sender.send(line).is_err() || done {
+            return;
+        }
+    }
+}
+
+fn drain_worker_events(receiver: &Receiver<AgentEvent>, printer: &mut EventPrinter) {
+    loop {
+        match receiver.try_recv() {
+            Ok(event) => printer.print(event),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return,
+        }
+    }
+}
+
+fn print_prompt() -> Result<(), io::Error> {
+    print!("mh> ");
+    io::stdout().flush()
+}
+
+fn print_repl_help() {
+    println!("/resume  resume the workspace session");
+    println!("/session show session state");
+    println!("/quit    exit (interrupts an active agent)");
 }
 
 struct EventPrinter {
@@ -209,6 +330,27 @@ fn print_event(event: AgentEvent) {
             }
         }
         AgentEvent::PtcStarted => eprintln!("[ptc] executing"),
+        AgentEvent::PtcHostCallStarted { call_id, name } => {
+            eprintln!("[ptc:{call_id}] {name}");
+        }
+        AgentEvent::PtcHostCallCompleted {
+            call_id,
+            name,
+            ok,
+            duration_ms,
+        } => {
+            let status = if ok { "ok" } else { "failed" };
+            eprintln!("[ptc:{call_id}] {name}: {status} ({duration_ms} ms)");
+        }
+        AgentEvent::EvidenceRecorded { kind, ok } => {
+            let status = if ok { "pass" } else { "fail" };
+            eprintln!("[verify] {kind}: {status}");
+        }
+        AgentEvent::SteeringQueued { content } => eprintln!("[steering] queued: {content}"),
+        AgentEvent::SteeringApplied { content } => eprintln!("[steering] applied: {content}"),
+        AgentEvent::RepeatedActionDetected { fingerprint } => {
+            eprintln!("[ptc] repeated action detected ({fingerprint})");
+        }
         AgentEvent::ToolCompleted {
             outcome,
             tool_calls,

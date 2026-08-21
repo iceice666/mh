@@ -3,8 +3,8 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use mh::ptc::{PtcBudget, PtcOutcome, PtcRuntime};
-use mh::tools::{Capabilities, ResultStore};
+use mh::ptc::{PtcBudget, PtcDiagnosticKind, PtcEvent, PtcOutcome, PtcRuntime};
+use mh::tools::{Capabilities, ResultStore, ToolEffect};
 
 fn runtime(dir: &std::path::Path) -> PtcRuntime {
     PtcRuntime::new(
@@ -296,4 +296,217 @@ fn process_budget_is_enforced() {
         &no_cancel,
     );
     assert!(matches!(r.outcome, PtcOutcome::Failed(_)));
+}
+
+#[test]
+fn host_calls_are_traced_with_effects_and_mutation_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = run(
+        dir.path(),
+        r#"
+        write("trace.txt", "hello");
+        return read("trace.txt").content;
+        "#,
+    );
+    assert_eq!(r.outcome, PtcOutcome::Completed);
+    assert_eq!(r.mutation_epoch, 1);
+    assert!(matches!(
+        &r.events[0],
+        PtcEvent::HostCallStarted { call_id: 1, name, .. } if name == "write"
+    ));
+    assert!(r.events.iter().any(|event| matches!(
+        event,
+        PtcEvent::HostCallCompleted {
+            call_id: 1,
+            name,
+            effect: ToolEffect::WorkspaceMutation,
+            ok: true,
+            paths,
+            ..
+        } if name == "write" && paths == &["trace.txt".to_string()]
+    )));
+    assert!(r.events.iter().any(|event| matches!(
+        event,
+        PtcEvent::HostCallCompleted {
+            call_id: 2,
+            name,
+            effect: ToolEffect::ReadOnly,
+            ok: true,
+            ..
+        } if name == "read"
+    )));
+}
+
+#[test]
+fn batch_preserves_order_isolates_errors_and_rejects_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+    std::fs::write(dir.path().join("c.txt"), "charlie").unwrap();
+    let r = run(
+        dir.path(),
+        r#"
+        var reads = batch("read", [
+            {path: "a.txt"},
+            {path: "missing.txt"},
+            {path: "c.txt"}
+        ]);
+        var writes = batch("write", [{path: "x.txt", content: "bad"}]);
+        return {reads: reads, writes: writes};
+        "#,
+    );
+    assert_eq!(r.outcome, PtcOutcome::Completed);
+    assert_eq!(r.value["reads"][0]["content"], "alpha");
+    assert!(r.value["reads"][1]["error"].as_str().is_some());
+    assert_eq!(r.value["reads"][2]["content"], "charlie");
+    assert_eq!(
+        r.value["writes"][0]["error"],
+        "tool 'write' is not batch-safe"
+    );
+    assert!(!dir.path().join("x.txt").exists());
+    assert_eq!(r.tool_calls, 3);
+}
+
+#[test]
+fn batch_exec_uses_bounded_parallel_host_workers() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = PtcRuntime::new(
+        Capabilities::new(dir.path()),
+        ResultStore::new(),
+        PtcBudget {
+            max_parallel_tools: 2,
+            ..PtcBudget::default()
+        },
+    );
+    let started = std::time::Instant::now();
+    let r = rt.execute(
+        r#"
+        var out = batch("exec", [
+            {command: ["/bin/sh", "-c", "sleep 0.15; printf 0"]},
+            {command: ["/bin/sh", "-c", "sleep 0.15; printf 1"]},
+            {command: ["/bin/sh", "-c", "sleep 0.15; printf 2"]},
+            {command: ["/bin/sh", "-c", "sleep 0.15; printf 3"]}
+        ]);
+        return [out[0].stdout.read().content, out[1].stdout.read().content,
+                out[2].stdout.read().content, out[3].stdout.read().content];
+        "#,
+        &Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(r.outcome, PtcOutcome::Completed);
+    assert_eq!(r.value, serde_json::json!(["0", "1", "2", "3"]));
+    assert!(started.elapsed() < std::time::Duration::from_millis(550));
+    assert_eq!(r.tool_calls, 4);
+}
+
+#[test]
+fn result_handles_expose_complete_v2_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let rt = PtcRuntime::new(
+        Capabilities::new(dir.path()),
+        ResultStore::new(),
+        PtcBudget {
+            max_result_bytes: 4,
+            ..PtcBudget::default()
+        },
+    );
+    let r = rt.execute(
+        r#"
+        var out = exec({command: ["/bin/sh", "-c", "printf 0123456789"]});
+        return {
+            durationMs: out.durationMs,
+            id: out.stdout.id,
+            length: out.stdout.length,
+            totalBytes: out.stdout.totalBytes,
+            truncated: out.stdout.truncated,
+            kind: out.stdout.kind,
+            retained: out.stdout.read().content
+        };
+        "#,
+        &Arc::new(AtomicBool::new(false)),
+    );
+    assert_eq!(r.outcome, PtcOutcome::Completed);
+    assert!(r.value["durationMs"].as_u64().is_some());
+    assert!(r.value["id"].as_u64().is_some());
+    assert_eq!(r.value["length"], 4);
+    assert_eq!(r.value["totalBytes"], 10);
+    assert_eq!(r.value["truncated"], true);
+    assert_eq!(r.value["kind"], "stdout");
+    assert_eq!(r.value["retained"], "6789");
+}
+
+#[test]
+fn collection_truncation_remains_visible_on_iterable_arrays() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("many.txt"), "hit one\nhit two\n").unwrap();
+    let r = run(
+        dir.path(),
+        r#"
+        var matches = grep({pattern: "hit", path: "many.txt", max: 1});
+        return {length: matches.length, first: matches[0].line, truncated: matches.truncated};
+        "#,
+    );
+    assert_eq!(
+        r.value,
+        serde_json::json!({"length": 1, "first": 1, "truncated": true})
+    );
+}
+
+#[test]
+fn evidence_records_current_epoch_and_result_handles() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = run(
+        dir.path(),
+        r#"
+        write("changed.txt", "yes");
+        var check = exec({command: ["/bin/echo", "verified"]});
+        evidence("tests", check.exitCode === 0, {stdout: check.stdout.id, note: "cargo test"});
+        return true;
+        "#,
+    );
+    let evidence = r
+        .events
+        .iter()
+        .find_map(|event| match event {
+            PtcEvent::EvidenceRecorded { evidence } => Some(evidence),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(evidence.kind, "tests");
+    assert!(evidence.ok);
+    assert_eq!(evidence.mutation_epoch, 1);
+    assert_eq!(evidence.result_ids.len(), 1);
+    assert_eq!(evidence.note.as_deref(), Some("cargo test"));
+}
+
+#[test]
+fn unsupported_syntax_has_structured_repair_diagnostic() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = run(dir.path(), "let x = 1; return x;");
+    let diagnostic = r.diagnostic.unwrap();
+    assert_eq!(diagnostic.kind, PtcDiagnosticKind::UnsupportedSyntax);
+    assert!(diagnostic.hint.unwrap().contains("var"));
+    assert_eq!(r.value["ptcError"]["kind"], "unsupported_syntax");
+}
+
+#[test]
+fn cancellation_interrupts_a_running_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let signal = cancelled.clone();
+    let trigger = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        signal.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+    let r = runtime(dir.path()).execute(
+        r#"
+        batch("exec", [
+            {command: ["/bin/sh", "-c", "sleep 2"]},
+            {command: ["/bin/sh", "-c", "sleep 2"]}
+        ]);
+        return "unreachable";
+        "#,
+        &cancelled,
+    );
+    trigger.join().unwrap();
+    assert_eq!(r.outcome, PtcOutcome::Interrupted);
+    assert!(r.duration_ms < 1_000);
 }

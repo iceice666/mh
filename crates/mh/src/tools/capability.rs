@@ -1,23 +1,39 @@
 //! Capability model (spec §16).
 //!
-//! v0.1 keeps the simple default policy: read/write inside the
-//! workspace, exec from the workspace, network disabled. The
-//! [`Capabilities`] struct exists so policy decisions live in one
-//! place; `PathRule` lists are deliberately deferred until needed.
+//! Filesystem access is confined beneath a canonical workspace root.
+//! Subprocess policy is explicit about its limited guarantee: workspace cwd
+//! plus lifetime/output control, rather than an operating-system sandbox.
 
-use std::path::Path;
-use std::path::PathBuf;
-use std::path::absolute;
+use std::path::{Path, PathBuf, absolute};
+
+use serde::{Deserialize, Serialize};
+
+/// Coarse side-effect class for a host tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolEffect {
+    ReadOnly,
+    WorkspaceMutation,
+    Process,
+    Meta,
+}
+
+/// Subprocess capability. `WorkspaceCwd` controls cwd and lifetime/output,
+/// but is not an operating-system sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessPolicy {
+    Disabled,
+    WorkspaceCwd,
+}
 
 /// What side effects a PTC execution may perform.
 #[derive(Debug, Clone)]
 pub struct Capabilities {
     /// Workspace root; all fs access is confined beneath it.
     pub workspace: PathBuf,
-    /// Allow running subprocesses via `exec`.
-    pub exec: bool,
-    /// Allow network access (no v0.1 tool uses it; always false).
-    pub network: bool,
+    /// Policy governing subprocess execution.
+    pub process: ProcessPolicy,
 }
 
 /// Sandbox violation; the path the program tried to reach.
@@ -34,22 +50,53 @@ impl std::error::Error for SandboxError {}
 
 impl Capabilities {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        let workspace = workspace.into();
         Self {
-            workspace: workspace.into(),
-            exec: true,
-            network: false,
+            workspace: std::fs::canonicalize(&workspace).unwrap_or_else(|_| normalize(&workspace)),
+            process: ProcessPolicy::WorkspaceCwd,
         }
     }
 
-    /// Resolves `path` (relative to the workspace when not absolute)
-    /// and verifies it stays inside the workspace.
-    ///
-    /// Lexical `..` traversal is rejected rather than normalized away:
-    /// model-generated paths that try to escape are a bug to surface,
-    /// not to silently reinterpret.
-    pub fn resolve(&self, path: &str) -> Result<PathBuf, SandboxError> {
+    /// Resolves an existing path for reading, following symlinks only when
+    /// their canonical target remains beneath the canonical workspace root.
+    pub fn resolve_existing_read(&self, path: &str) -> Result<PathBuf, SandboxError> {
+        let lexical = self.resolve_lexical(path)?;
+        let real = std::fs::canonicalize(&lexical)
+            .map_err(|_| SandboxError(format!("{path}: not found")))?;
+        self.ensure_inside(path, &real)?;
+        Ok(real)
+    }
+
+    /// Resolves a write target without allowing an existing symlink, or a
+    /// symlink in a not-yet-created target's ancestry, to escape the workspace.
+    pub fn resolve_for_write(&self, path: &str) -> Result<PathBuf, SandboxError> {
+        let lexical = self.resolve_lexical(path)?;
+
+        if std::fs::symlink_metadata(&lexical).is_ok() {
+            let real =
+                std::fs::canonicalize(&lexical).map_err(|_| SandboxError(path.to_string()))?;
+            self.ensure_inside(path, &real)?;
+        }
+
+        let mut ancestor = lexical.as_path();
+        while std::fs::symlink_metadata(ancestor).is_err() {
+            ancestor = ancestor
+                .parent()
+                .ok_or_else(|| SandboxError(path.to_string()))?;
+        }
+        let real_ancestor =
+            std::fs::canonicalize(ancestor).map_err(|_| SandboxError(path.to_string()))?;
+        self.ensure_inside(path, &real_ancestor)?;
+        Ok(lexical)
+    }
+
+    fn resolve_lexical(&self, path: &str) -> Result<PathBuf, SandboxError> {
         let raw = Path::new(path);
-        if path.split(['/', '\\']).any(|seg| seg == "..") {
+        if raw
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+            || path.split(['/', '\\']).any(|segment| segment == "..")
+        {
             return Err(SandboxError(path.to_string()));
         }
         let joined = if raw.is_absolute() {
@@ -57,34 +104,18 @@ impl Capabilities {
         } else {
             self.workspace.join(raw)
         };
-        let canonical_input = normalize(&joined);
-        let root = normalize(&self.workspace);
-        if !canonical_input.starts_with(&root) {
+        let lexical = normalize(&joined);
+        if !lexical.starts_with(&self.workspace) {
             return Err(SandboxError(path.to_string()));
         }
-        Ok(canonical_input)
+        Ok(lexical)
     }
 
-    /// Same as [`resolve`] but additionally checks the path exists on
-    /// disk with a canonical form inside the workspace (symlinks are
-    /// resolved by the OS).
-    pub fn resolve_existing(&self, path: &str) -> Result<PathBuf, SandboxError> {
-        let lexical = self.resolve(path)?;
-        match std::fs::canonicalize(&lexical) {
-            Ok(real) => {
-                // Compare against the canonicalized root too: on
-                // macOS, /tmp is a symlink to /private/tmp, so the
-                // lexical root never prefixes the canonical path.
-                let root = match std::fs::canonicalize(&self.workspace) {
-                    Ok(r) => r,
-                    Err(_) => normalize(&self.workspace),
-                };
-                if !real.starts_with(&root) {
-                    return Err(SandboxError(path.to_string()));
-                }
-                Ok(real)
-            }
-            Err(_) => Err(SandboxError(format!("{path}: not found"))),
+    fn ensure_inside(&self, path: &str, canonical: &Path) -> Result<(), SandboxError> {
+        if canonical.starts_with(&self.workspace) {
+            Ok(())
+        } else {
+            Err(SandboxError(path.to_string()))
         }
     }
 }
@@ -120,26 +151,45 @@ fn normalize(p: &Path) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn caps() -> Capabilities {
-        Capabilities::new("/w/proj")
+    fn caps() -> (Capabilities, tempfile::TempDir) {
+        let workspace = tempfile::tempdir().unwrap();
+        (Capabilities::new(workspace.path()), workspace)
     }
 
     #[test]
-    fn allows_inside_paths() {
+    fn allows_new_inside_paths_and_rejects_dotdot() {
+        let workspace = tempfile::tempdir().unwrap();
+        let caps = Capabilities::new(workspace.path());
         assert_eq!(
-            caps().resolve("src/main.rs").unwrap(),
-            PathBuf::from("/w/proj/src/main.rs")
+            caps.resolve_for_write("src/main.rs").unwrap(),
+            std::fs::canonicalize(workspace.path())
+                .unwrap()
+                .join("src/main.rs")
         );
-        assert!(
-            caps().resolve("a/../b").is_err(),
-            "dotdot segments are rejected outright"
-        );
+        assert!(caps.resolve_for_write("a/../b").is_err());
     }
 
     #[test]
-    fn rejects_escape() {
-        assert!(caps().resolve("../outside").is_err());
-        assert!(caps().resolve("/etc/passwd").is_err());
-        assert!(caps().resolve("sub/../../escape").is_err());
+    fn rejects_lexical_escape() {
+        let (caps, _workspace) = caps();
+        assert!(caps.resolve_for_write("../outside").is_err());
+        assert!(caps.resolve_for_write("/etc/passwd").is_err());
+        assert!(caps.resolve_for_write("sub/../../escape").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape_for_existing_and_new_targets() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("existing"), "secret").unwrap();
+        symlink(outside.path(), workspace.path().join("escape")).unwrap();
+        let caps = Capabilities::new(workspace.path());
+
+        assert!(caps.resolve_existing_read("escape/existing").is_err());
+        assert!(caps.resolve_for_write("escape/existing").is_err());
+        assert!(caps.resolve_for_write("escape/new/deep/file").is_err());
     }
 }

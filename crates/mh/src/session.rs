@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ptc::{PtcOutcome, PtcResult};
-use crate::tools::ResultStore;
+use crate::tools::{ResultId, ResultStore, ToolEffect};
 
 const SESSION_DIR: &str = ".mh";
 const EVENT_FILE: &str = "session.jsonl";
@@ -65,6 +65,38 @@ pub struct SessionState {
     pub updated_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceRecord {
+    pub kind: String,
+    pub ok: bool,
+    pub mutation_epoch: u64,
+    pub result_ids: Vec<ResultId>,
+    pub note: Option<String>,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PtcSummary {
+    pub ok: bool,
+    pub value: Value,
+    pub error: Option<String>,
+    pub tool_calls: usize,
+    pub duration_ms: u64,
+    pub mutation_epoch: u64,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkState {
+    pub objective: Option<String>,
+    pub latest_user_message: Option<String>,
+    pub touched_files: Vec<String>,
+    pub latest_ptc: Option<PtcSummary>,
+    pub latest_failure: Option<PtcSummary>,
+    pub mutation_epoch: u64,
+    pub evidence: Vec<EvidenceRecord>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
@@ -91,6 +123,28 @@ pub enum SessionEvent {
         value: Value,
         tool_calls: usize,
         duration_ms: u64,
+    },
+    ToolCompleted {
+        call_id: u64,
+        name: String,
+        args_hash: u64,
+        effect: ToolEffect,
+        ok: bool,
+        duration_ms: u64,
+        result_ids: Vec<ResultId>,
+        paths: Vec<String>,
+    },
+    EvidenceRecorded {
+        evidence: EvidenceRecord,
+    },
+    SteeringQueued {
+        content: String,
+    },
+    SteeringApplied {
+        content: String,
+    },
+    RepeatedActionDetected {
+        fingerprint: String,
     },
     Compacted {
         summary: String,
@@ -250,6 +304,67 @@ impl Session {
     pub fn state(&self) -> &SessionState {
         &self.state
     }
+    pub fn work_state(&self) -> WorkState {
+        let mut work = WorkState {
+            objective: self.state.task.clone(),
+            ..WorkState::default()
+        };
+        for record in &self.events {
+            match &record.event {
+                SessionEvent::UserMessage { content }
+                | SessionEvent::SteeringApplied { content } => {
+                    work.latest_user_message = Some(content.clone());
+                }
+                SessionEvent::ToolCompleted {
+                    effect: ToolEffect::WorkspaceMutation,
+                    ok: true,
+                    paths,
+                    ..
+                } => {
+                    work.mutation_epoch = work.mutation_epoch.saturating_add(1);
+                    work.touched_files.extend(paths.iter().cloned());
+                }
+                SessionEvent::PtcCompleted {
+                    value,
+                    tool_calls,
+                    duration_ms,
+                } => {
+                    work.latest_ptc = Some(PtcSummary {
+                        ok: true,
+                        value: value.clone(),
+                        error: None,
+                        tool_calls: *tool_calls,
+                        duration_ms: *duration_ms,
+                        mutation_epoch: work.mutation_epoch,
+                        timestamp_ms: record.timestamp_ms,
+                    });
+                }
+                SessionEvent::PtcFailed {
+                    error,
+                    value,
+                    tool_calls,
+                    duration_ms,
+                } => {
+                    work.latest_failure = Some(PtcSummary {
+                        ok: false,
+                        value: value.clone(),
+                        error: Some(error.clone()),
+                        tool_calls: *tool_calls,
+                        duration_ms: *duration_ms,
+                        mutation_epoch: work.mutation_epoch,
+                        timestamp_ms: record.timestamp_ms,
+                    });
+                }
+                SessionEvent::EvidenceRecorded { evidence } => {
+                    work.evidence.push(evidence.clone());
+                }
+                _ => {}
+            }
+        }
+        work.touched_files.sort();
+        work.touched_files.dedup();
+        work
+    }
 
     pub fn root(&self) -> &Path {
         &self.root
@@ -379,5 +494,82 @@ mod tests {
             })
             .unwrap();
         assert_eq!(Session::resume(dir.path()).unwrap().events().len(), 2);
+    }
+    #[test]
+    fn work_state_reconstructs_mutations_evidence_and_steering() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut session = Session::open(dir.path()).unwrap();
+        session.begin_task("root objective").unwrap();
+        session
+            .append(SessionEvent::UserMessage {
+                content: "initial instruction".to_string(),
+            })
+            .unwrap();
+        session
+            .append(SessionEvent::SteeringQueued {
+                content: "not applied".to_string(),
+            })
+            .unwrap();
+        session
+            .append(SessionEvent::ToolCompleted {
+                call_id: 1,
+                name: "edit".to_string(),
+                args_hash: 11,
+                effect: ToolEffect::WorkspaceMutation,
+                ok: true,
+                duration_ms: 2,
+                result_ids: vec![],
+                paths: vec!["src/b.rs".to_string(), "src/a.rs".to_string()],
+            })
+            .unwrap();
+        session
+            .append(SessionEvent::ToolCompleted {
+                call_id: 2,
+                name: "write".to_string(),
+                args_hash: 12,
+                effect: ToolEffect::WorkspaceMutation,
+                ok: false,
+                duration_ms: 2,
+                result_ids: vec![],
+                paths: vec!["src/failed.rs".to_string()],
+            })
+            .unwrap();
+        session
+            .append(SessionEvent::EvidenceRecorded {
+                evidence: EvidenceRecord {
+                    kind: "tests".to_string(),
+                    ok: true,
+                    mutation_epoch: 1,
+                    result_ids: vec![ResultId(7)],
+                    note: None,
+                    timestamp_ms: 99,
+                },
+            })
+            .unwrap();
+        session
+            .append(SessionEvent::SteeringApplied {
+                content: "applied instruction".to_string(),
+            })
+            .unwrap();
+
+        let work = session.work_state();
+        assert_eq!(work.objective.as_deref(), Some("root objective"));
+        assert_eq!(
+            work.latest_user_message.as_deref(),
+            Some("applied instruction")
+        );
+        assert_eq!(work.mutation_epoch, 1);
+        assert_eq!(work.touched_files, vec!["src/a.rs", "src/b.rs"]);
+        assert_eq!(work.evidence.len(), 1);
+        assert_eq!(work.evidence[0].mutation_epoch, 1);
+    }
+
+    #[test]
+    fn reads_v01_event_records() {
+        let record: EventRecord = serde_json::from_str(
+            r#"{"seq":1,"timestamp_ms":2,"type":"ptc_completed","value":{"ok":true},"tool_calls":1,"duration_ms":3}"#,
+        )
+        .unwrap();
+        assert!(matches!(record.event, SessionEvent::PtcCompleted { .. }));
     }
 }

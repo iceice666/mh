@@ -20,7 +20,17 @@ pub struct ResultId(pub u64);
 pub struct StoredResult {
     pub id: ResultId,
     pub data: Vec<u8>,
-    /// Truncated by the tool if it exceeded the byte cap.
+    /// Bytes produced before bounded tail retention.
+    pub total_bytes: u64,
+    /// Whether fewer bytes are retained than were produced.
+    pub truncated: bool,
+}
+
+/// Lightweight metadata used to construct runtime result handles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResultMetadata {
+    pub length: usize,
+    pub total_bytes: u64,
     pub truncated: bool,
 }
 
@@ -28,7 +38,10 @@ pub struct StoredResult {
 struct PersistedResult {
     id: u64,
     hash: String,
+    #[serde(default)]
     truncated: bool,
+    #[serde(default)]
+    total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -73,11 +86,15 @@ impl ResultStore {
                     continue;
                 };
                 inner.next = inner.next.max(meta.id.saturating_add(1));
+                let total_bytes = meta.total_bytes.unwrap_or_else(|| {
+                    (data.len() as u64).saturating_add(u64::from(meta.truncated))
+                });
                 inner.map.insert(
                     meta.id,
                     StoredResult {
                         id: ResultId(meta.id),
                         data,
+                        total_bytes,
                         truncated: meta.truncated,
                     },
                 );
@@ -91,18 +108,26 @@ impl ResultStore {
     /// Stores `data`; returns the handle. Data larger than `cap` keeps
     /// its tail, which usually contains the failure evidence.
     pub fn put(&self, data: Vec<u8>, cap: usize) -> StoredResult {
-        let truncated = data.len() > cap;
-        let data = if truncated {
+        let total_bytes = data.len() as u64;
+        self.put_with_total(data, total_bytes, cap)
+    }
+
+    /// Stores already-bounded producer output while preserving the exact
+    /// number of bytes emitted before retention.
+    pub fn put_with_total(&self, data: Vec<u8>, total_bytes: u64, cap: usize) -> StoredResult {
+        let data = if data.len() > cap {
             data[data.len().saturating_sub(cap)..].to_vec()
         } else {
             data
         };
+        let truncated = total_bytes > data.len() as u64;
         let mut guard = self.inner.lock().expect("result store poisoned");
         let id = guard.next.max(1);
         guard.next = id.saturating_add(1);
         let result = StoredResult {
             id: ResultId(id),
             data,
+            total_bytes,
             truncated,
         };
         if let Some(dir) = guard.persistent_dir.as_deref() {
@@ -119,6 +144,14 @@ impl ResultStore {
             .map
             .get(&id.0)
             .cloned()
+    }
+
+    pub fn metadata(&self, id: ResultId) -> Option<ResultMetadata> {
+        self.get(id).map(|result| ResultMetadata {
+            length: result.data.len(),
+            total_bytes: result.total_bytes,
+            truncated: result.truncated,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -147,6 +180,7 @@ fn persist(dir: &Path, result: &StoredResult) -> std::io::Result<()> {
         id: result.id.0,
         hash,
         truncated: result.truncated,
+        total_bytes: Some(result.total_bytes),
     };
     let mut index = OpenOptions::new()
         .create(true)
@@ -176,6 +210,7 @@ mod tests {
         let result = store.put(b"0123456789abcdef".to_vec(), 8);
         assert!(result.truncated);
         assert_eq!(result.data, b"89abcdef");
+        assert_eq!(result.total_bytes, 16);
         assert_eq!(store.text(result.id).unwrap(), "89abcdef");
     }
 
@@ -189,13 +224,29 @@ mod tests {
     }
 
     #[test]
-    fn persistent_store_recovers_handles() {
+    fn persistent_store_recovers_total_bytes_and_old_metadata() {
         let dir = tempfile::tempdir().unwrap();
         let id = {
             let store = ResultStore::persistent(dir.path()).unwrap();
-            store.put(b"durable".to_vec(), 1024).id
+            store.put_with_total(b"tail".to_vec(), 100, 1024).id
         };
         let reopened = ResultStore::persistent(dir.path()).unwrap();
-        assert_eq!(reopened.text(id).unwrap(), "durable");
+        let result = reopened.get(id).unwrap();
+        assert_eq!(result.data, b"tail");
+        assert_eq!(result.total_bytes, 100);
+        assert!(result.truncated);
+
+        let old_dir = tempfile::tempdir().unwrap();
+        std::fs::write(old_dir.path().join("blob"), b"legacy").unwrap();
+        std::fs::write(
+            old_dir.path().join("results.jsonl"),
+            "{\"id\":7,\"hash\":\"blob\",\"truncated\":false}\n",
+        )
+        .unwrap();
+        let old = ResultStore::persistent(old_dir.path())
+            .unwrap()
+            .get(ResultId(7))
+            .unwrap();
+        assert_eq!(old.total_bytes, 6);
     }
 }

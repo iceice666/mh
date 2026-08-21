@@ -11,15 +11,18 @@
 //! [`GcRoot`], which wraps `JS_PushGCRef`/`JS_PopGCRef`.
 
 use std::ffi::c_void;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::session::EvidenceRecord;
 use crate::tools::capability::Capabilities;
 use crate::tools::fs_tools;
 use crate::tools::store::ResultStore;
+use crate::tools::{ResultId, ToolEffect};
 
 use super::wrapper::{JSValue, Vm, VmError};
 
@@ -34,6 +37,8 @@ pub struct PtcBudget {
     pub max_output_bytes: usize,
     /// JS heap size for the VM.
     pub heap_bytes: usize,
+    /// Maximum number of host operations run concurrently by `batch`.
+    pub max_parallel_tools: usize,
 }
 
 impl Default for PtcBudget {
@@ -43,6 +48,7 @@ impl Default for PtcBudget {
             instruction_limit: Some(100_000_000),
             max_tool_calls: 200,
             max_processes: 16,
+            max_parallel_tools: 8,
             max_result_bytes: 4 << 20,
             max_output_bytes: 64 * 1024,
             heap_bytes: 4 << 20,
@@ -59,6 +65,60 @@ pub enum PtcOutcome {
     Failed(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PtcDiagnosticKind {
+    Syntax,
+    Runtime,
+    UnsupportedSyntax,
+    ToolBudget,
+    ProcessBudget,
+    InstructionBudget,
+    WallTime,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtcDiagnostic {
+    pub kind: PtcDiagnosticKind,
+    pub message: String,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+    pub hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCallOutcome {
+    Ok,
+    Error,
+    Cancelled,
+    BudgetExceeded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PtcEvent {
+    HostCallStarted {
+        call_id: u64,
+        name: String,
+        args_hash: u64,
+    },
+    HostCallCompleted {
+        call_id: u64,
+        name: String,
+        args_hash: u64,
+        effect: ToolEffect,
+        outcome: HostCallOutcome,
+        ok: bool,
+        duration_ms: u64,
+        result_ids: Vec<ResultId>,
+        paths: Vec<String>,
+    },
+    EvidenceRecorded {
+        evidence: EvidenceRecord,
+    },
+}
+
 /// Result of one PTC execution.
 #[derive(Debug, Clone)]
 pub struct PtcResult {
@@ -67,14 +127,20 @@ pub struct PtcResult {
     pub outcome: PtcOutcome,
     pub tool_calls: usize,
     pub duration_ms: u64,
+    pub events: Vec<PtcEvent>,
+    pub mutation_epoch: u64,
+    pub diagnostic: Option<PtcDiagnostic>,
 }
 
 struct ExecState {
     cancelled: Arc<AtomicBool>,
     deadline: Instant,
-    tool_calls: Arc<AtomicU64>,
+    tool_calls: AtomicU64,
     process_calls: AtomicU64,
     interrupt_polls: AtomicU64,
+    next_call_id: AtomicU64,
+    mutation_epoch: AtomicU64,
+    events: Mutex<Vec<PtcEvent>>,
     max_tool_calls: u64,
     max_processes: u64,
     max_interrupt_polls: Option<u64>,
@@ -159,17 +225,28 @@ impl PtcRuntime {
         }
     }
 
-    /// Executes `program` and converts its return value to JSON.
-    ///
-    /// Cancellation is polled by the VM interrupt handler and tools.
+    /// Executes at mutation epoch zero.
     pub fn execute(&self, program: &str, cancelled: &Arc<AtomicBool>) -> PtcResult {
+        self.execute_at_epoch(program, cancelled, 0)
+    }
+
+    /// Executes `program`, projecting mutations from `mutation_epoch`.
+    pub fn execute_at_epoch(
+        &self,
+        program: &str,
+        cancelled: &Arc<AtomicBool>,
+        mutation_epoch: u64,
+    ) -> PtcResult {
         let start = Instant::now();
         let state = Box::new(ExecState {
             cancelled: cancelled.clone(),
             deadline: start + Duration::from_millis(self.budget.wall_time_ms),
-            tool_calls: Arc::new(AtomicU64::new(0)),
+            tool_calls: AtomicU64::new(0),
             process_calls: AtomicU64::new(0),
             interrupt_polls: AtomicU64::new(0),
+            next_call_id: AtomicU64::new(1),
+            mutation_epoch: AtomicU64::new(mutation_epoch),
+            events: Mutex::new(Vec::new()),
             max_tool_calls: self.budget.max_tool_calls as u64,
             max_processes: self.budget.max_processes as u64,
             max_interrupt_polls: self
@@ -183,17 +260,10 @@ impl PtcRuntime {
             Ok(v) => v,
             Err(e) => {
                 unsafe { drop(Box::from_raw(state_ptr)) };
-                return PtcResult {
-                    value: Value::Null,
-                    outcome: PtcOutcome::Failed(e.to_string()),
-                    tool_calls: 0,
-                    duration_ms: 0,
-                };
+                return empty_result(PtcOutcome::Failed(e.to_string()), start, mutation_epoch);
             }
         };
 
-        // Both the interrupt handler and the mh closure dispatch read
-        // the context-opaque DispatchBox (handler field first).
         let dispatch = Box::new(DispatchBox {
             handler: dispatch_closure,
             state: unsafe { &*state_ptr },
@@ -202,68 +272,59 @@ impl PtcRuntime {
             budget: &self.budget,
         });
         let dispatch_ptr = Box::into_raw(dispatch);
-        unsafe {
-            vm.install_opaque(dispatch_ptr.cast::<c_void>(), interrupt_handler);
-        }
+        unsafe { vm.install_opaque(dispatch_ptr.cast::<c_void>(), interrupt_handler) };
 
-        let result = (|| {
-            // Install ABI globals.
+        let execution = (|| -> (Value, PtcOutcome, Option<PtcDiagnostic>) {
             if let Err(e) = self.install_globals(&mut vm) {
-                return PtcResult {
-                    value: Value::Null,
-                    outcome: PtcOutcome::Failed(e.to_string()),
-                    tool_calls: 0,
-                    duration_ms: elapsed_ms(start),
-                };
+                let message = e.to_string();
+                return (
+                    Value::Null,
+                    PtcOutcome::Failed(message.clone()),
+                    Some(diagnostic(PtcDiagnosticKind::Runtime, message)),
+                );
             }
-            // Run.
             let wrapped = format!("(function() {{\n{program}\n}})()");
             let val = match vm.eval(&wrapped, "ptc.js") {
                 Ok(v) => v,
                 Err(VmError::Exception(msg)) => {
-                    let outcome = if cancelled.load(Ordering::Relaxed) {
-                        Some(PtcOutcome::Interrupted)
-                    } else if Instant::now() >= state_deadline(dispatch_ptr) {
-                        Some(PtcOutcome::BudgetExceeded("wall time"))
-                    } else if instruction_budget_exceeded(dispatch_ptr) {
-                        Some(PtcOutcome::BudgetExceeded("instruction limit"))
-                    } else {
-                        None
+                    let diag = classify_diagnostic(program, &msg, cancelled, dispatch_ptr);
+                    let outcome = match diag.kind {
+                        PtcDiagnosticKind::Cancelled => PtcOutcome::Interrupted,
+                        PtcDiagnosticKind::WallTime => PtcOutcome::BudgetExceeded("wall time"),
+                        PtcDiagnosticKind::InstructionBudget => {
+                            PtcOutcome::BudgetExceeded("instruction limit")
+                        }
+                        _ => PtcOutcome::Failed(msg.clone()),
                     };
-                    if let Some(outcome) = outcome {
-                        return PtcResult {
-                            value: Value::Null,
-                            outcome,
-                            tool_calls: tool_calls(dispatch_ptr),
-                            duration_ms: elapsed_ms(start),
-                        };
-                    }
-                    return PtcResult {
-                        value: json!({ "ptcError": msg }),
-                        outcome: PtcOutcome::Failed(msg),
-                        tool_calls: tool_calls(dispatch_ptr),
-                        duration_ms: elapsed_ms(start),
-                    };
+                    return (json!({ "ptcError": &diag }), outcome, Some(diag));
                 }
                 Err(e) => {
-                    return PtcResult {
-                        value: Value::Null,
-                        outcome: PtcOutcome::Failed(e.to_string()),
-                        tool_calls: tool_calls(dispatch_ptr),
-                        duration_ms: elapsed_ms(start),
-                    };
+                    let message = e.to_string();
+                    let diag = diagnostic(PtcDiagnosticKind::Runtime, message.clone());
+                    return (
+                        json!({ "ptcError": &diag }),
+                        PtcOutcome::Failed(message),
+                        Some(diag),
+                    );
                 }
             };
-            // Convert result to JSON (bounded).
-            let js = vm_to_json(&vm, val, self.budget.max_output_bytes);
-            PtcResult {
-                value: js,
-                outcome: PtcOutcome::Completed,
-                tool_calls: tool_calls(dispatch_ptr),
-                duration_ms: elapsed_ms(start),
-            }
+            (
+                vm_to_json(&vm, val, self.budget.max_output_bytes),
+                PtcOutcome::Completed,
+                None,
+            )
         })();
 
+        let state = unsafe { &*state_ptr };
+        let result = PtcResult {
+            value: execution.0,
+            outcome: execution.1,
+            tool_calls: state.tool_calls.load(Ordering::Relaxed) as usize,
+            duration_ms: elapsed_ms(start),
+            events: state.events.lock().expect("event trace poisoned").clone(),
+            mutation_epoch: state.mutation_epoch.load(Ordering::Relaxed),
+            diagnostic: execution.2,
+        };
         unsafe {
             drop(Box::from_raw(dispatch_ptr));
             drop(Box::from_raw(state_ptr));
@@ -290,13 +351,25 @@ impl PtcRuntime {
             "glob",
             "grep",
             "exec",
+            "batch",
+            "evidence",
         ] {
             let f = unsafe { GcRoot::new(vm, make_fn(vm, name)) };
             v.set(g, name, f.get())?;
         }
         // tools.read(...) alias family (spec §18.1).
         let tools = unsafe { GcRoot::new(vm, v.object()) };
-        for name in ["read", "write", "edit", "glob", "grep", "exec", "call_tool"] {
+        for name in [
+            "read",
+            "write",
+            "edit",
+            "glob",
+            "grep",
+            "exec",
+            "call_tool",
+            "batch",
+            "evidence",
+        ] {
             let f = unsafe { GcRoot::new(vm, make_fn(vm, name)) };
             v.set(tools.get(), name, f.get())?;
         }
@@ -307,6 +380,73 @@ impl PtcRuntime {
 
 fn elapsed_ms(start: Instant) -> u64 {
     u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn empty_result(outcome: PtcOutcome, start: Instant, mutation_epoch: u64) -> PtcResult {
+    PtcResult {
+        value: Value::Null,
+        outcome,
+        tool_calls: 0,
+        duration_ms: elapsed_ms(start),
+        events: Vec::new(),
+        mutation_epoch,
+        diagnostic: None,
+    }
+}
+
+fn diagnostic(kind: PtcDiagnosticKind, message: String) -> PtcDiagnostic {
+    PtcDiagnostic {
+        kind,
+        message,
+        line: None,
+        column: None,
+        hint: None,
+    }
+}
+
+fn classify_diagnostic(
+    program: &str,
+    message: &str,
+    cancelled: &AtomicBool,
+    dispatch: *mut DispatchBox,
+) -> PtcDiagnostic {
+    let lower = message.to_ascii_lowercase();
+    let mut diag = if cancelled.load(Ordering::Relaxed) || lower.contains("cancelled") {
+        diagnostic(PtcDiagnosticKind::Cancelled, message.to_string())
+    } else if Instant::now() >= state_deadline(dispatch) {
+        diagnostic(PtcDiagnosticKind::WallTime, message.to_string())
+    } else if instruction_budget_exceeded(dispatch) {
+        diagnostic(PtcDiagnosticKind::InstructionBudget, message.to_string())
+    } else if lower.contains("tool call budget") {
+        diagnostic(PtcDiagnosticKind::ToolBudget, message.to_string())
+    } else if lower.contains("process budget") {
+        diagnostic(PtcDiagnosticKind::ProcessBudget, message.to_string())
+    } else if contains_unsupported_lexical_declaration(program)
+        || lower.contains("let")
+        || lower.contains("const")
+        || lower.contains("lexical")
+    {
+        let mut d = diagnostic(PtcDiagnosticKind::UnsupportedSyntax, message.to_string());
+        d.hint = Some("MicroQuickJS PTC uses var; replace let/const with var".to_string());
+        d
+    } else if lower.contains("syntax") || lower.contains("parse") {
+        diagnostic(PtcDiagnosticKind::Syntax, message.to_string())
+    } else {
+        diagnostic(PtcDiagnosticKind::Runtime, message.to_string())
+    };
+    let numbers: Vec<u32> = message
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    diag.line = numbers.first().copied();
+    diag.column = numbers.get(1).copied();
+    diag
+}
+
+fn contains_unsupported_lexical_declaration(program: &str) -> bool {
+    program
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|word| matches!(word, "let" | "const"))
 }
 
 // ---------------------------------------------------------------------------
@@ -322,10 +462,6 @@ struct DispatchBox<'a> {
     caps: &'a Capabilities,
     store: &'a ResultStore,
     budget: &'a PtcBudget,
-}
-
-fn tool_calls(p: *mut DispatchBox) -> usize {
-    unsafe { (*p).state.tool_calls.load(Ordering::Relaxed) as usize }
 }
 
 fn instruction_budget_exceeded(p: *mut DispatchBox) -> bool {
@@ -364,7 +500,7 @@ unsafe extern "C" fn dispatch_closure(
     }
 }
 
-/// Executes one host call; all argument values are rooted by the
+/// Executes one host call; all argument values are rooted by the callback frame.
 unsafe fn run_host_call(
     vm: &Vm,
     dispatch: *mut DispatchBox,
@@ -374,20 +510,6 @@ unsafe fn run_host_call(
     argv: *mut JSValue,
 ) -> Result<JSValue, String> {
     let d = unsafe { &*dispatch };
-    // Tool-call accounting & budget.
-    if matches!(
-        name,
-        "tool" | "call_tool" | "read" | "write" | "edit" | "glob" | "grep" | "exec"
-    ) {
-        let n = d.state.tool_calls.fetch_add(1, Ordering::Relaxed) + 1;
-        if n > d.state.max_tool_calls {
-            return Err("tool call budget exceeded".to_string());
-        }
-        if d.state.cancelled.load(Ordering::Relaxed) {
-            return Err("cancelled".to_string());
-        }
-    }
-
     let arg = |i: usize| -> Option<JSValue> {
         if (i as i32) < argc {
             Some(unsafe { *argv.add(i) })
@@ -395,41 +517,24 @@ unsafe fn run_host_call(
             None
         }
     };
-
     let v = vm.values();
 
     match name {
-        // canonical ABI ---------------------------------------------------
         "tool" | "call_tool" => {
             let tool_name = arg(0)
                 .and_then(|a| v.to_string(a).ok())
                 .ok_or("tool(name, args): name required")?;
-            let args_json = match arg(1) {
-                Some(a) => vm_to_json(vm, a, d.budget.max_output_bytes),
-                None => Value::Null,
-            };
-            if tool_name == "exec" {
-                let processes = d.state.process_calls.fetch_add(1, Ordering::Relaxed) + 1;
-                if processes > d.state.max_processes {
-                    return Err("process budget exceeded".to_string());
-                }
-                let out = fs_tools::exec(
-                    d.caps,
-                    d.store,
-                    &args_json,
-                    d.budget.max_result_bytes,
-                    &|| d.state.cancelled.load(Ordering::Relaxed),
-                );
-                Ok(exec_result_to_vm(vm, d, &out))
-            } else {
-                let out = dispatch_tool(d, &tool_name, &args_json);
-                Ok(json_to_vm(vm, &out))
-            }
+            let args = arg(1)
+                .map(|a| vm_to_json(vm, a, d.budget.max_output_bytes))
+                .unwrap_or(Value::Null);
+            let out = execute_child(d, &tool_name, args, true);
+            ensure_direct_host_call(&out)?;
+            Ok(tool_value_to_vm(vm, d, &tool_name, &out))
         }
-        // convenience globals (spec §8.1) --------------------------------
         "read" => {
             let args = read_args(&v, arg(0))?;
-            let out = fs_tools::read(d.caps, &args);
+            let out = execute_child(d, "read", args, true);
+            ensure_direct_host_call(&out)?;
             Ok(json_to_vm(vm, &out))
         }
         "write" => {
@@ -439,43 +544,105 @@ unsafe fn run_host_call(
             let content = arg(1)
                 .and_then(|a| v.to_string(a).ok())
                 .ok_or("write(path, content)")?;
-            let out = fs_tools::write(d.caps, &json!({ "path": path, "content": content }));
+            let out = execute_child(
+                d,
+                "write",
+                json!({ "path": path, "content": content }),
+                true,
+            );
+            ensure_direct_host_call(&out)?;
             Ok(json_to_vm(vm, &out))
         }
         "edit" => {
             let args = arg(0).ok_or("edit(argsObject)")?;
-            let j = vm_to_json(vm, args, d.budget.max_output_bytes);
-            let out = fs_tools::edit(d.caps, &j);
+            let out = execute_child(
+                d,
+                "edit",
+                vm_to_json(vm, args, d.budget.max_output_bytes),
+                true,
+            );
+            ensure_direct_host_call(&out)?;
             Ok(json_to_vm(vm, &out))
         }
         "glob" => {
             let pattern = arg(0)
                 .and_then(|a| v.to_string(a).ok())
                 .ok_or("glob(pattern)")?;
-            let out = fs_tools::glob(d.caps, &json!({ "pattern": pattern }));
-            let files = out.get("files").cloned().unwrap_or(out);
-            Ok(json_to_vm(vm, &files))
+            let out = execute_child(d, "glob", json!({ "pattern": pattern }), true);
+            ensure_direct_host_call(&out)?;
+            Ok(collection_to_vm(vm, &out, "files"))
         }
         "grep" => {
             let args = arg(0).ok_or("grep(argsObject)")?;
-            let j = vm_to_json(vm, args, d.budget.max_output_bytes);
-            let out = fs_tools::grep(d.caps, &j);
-            let matches = out.get("matches").cloned().unwrap_or(out);
-            Ok(json_to_vm(vm, &matches))
+            let out = execute_child(
+                d,
+                "grep",
+                vm_to_json(vm, args, d.budget.max_output_bytes),
+                true,
+            );
+            ensure_direct_host_call(&out)?;
+            Ok(collection_to_vm(vm, &out, "matches"))
         }
         "exec" => {
-            let processes = d.state.process_calls.fetch_add(1, Ordering::Relaxed) + 1;
-            if processes > d.state.max_processes {
-                return Err("process budget exceeded".to_string());
-            }
             let args = arg(0).ok_or("exec(argsObject)")?;
-            let j = vm_to_json(vm, args, d.budget.max_output_bytes);
-            let out = fs_tools::exec(d.caps, d.store, &j, d.budget.max_result_bytes, &|| {
-                d.state.cancelled.load(Ordering::Relaxed)
-            });
+            let out = execute_child(
+                d,
+                "exec",
+                vm_to_json(vm, args, d.budget.max_output_bytes),
+                true,
+            );
+            ensure_direct_host_call(&out)?;
             Ok(exec_result_to_vm(vm, d, &out))
         }
-        // ToolResult handle methods --------------------------------------
+        "batch" => {
+            if d.state.cancelled.load(Ordering::Relaxed) {
+                return Err("cancelled".to_string());
+            }
+            let tool_name = arg(0)
+                .and_then(|a| v.to_string(a).ok())
+                .ok_or("batch(name, args[]): name required")?;
+            let items_value = arg(1).ok_or("batch(name, args[]): args array required")?;
+            let items = vm_to_json(vm, items_value, d.budget.max_output_bytes);
+            let items = items
+                .as_array()
+                .ok_or("batch(name, args[]): args must be an array")?;
+            let outputs = execute_batch(d, &tool_name, items);
+            if d.state.cancelled.load(Ordering::Relaxed)
+                || outputs.iter().any(|output| {
+                    output
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .is_some_and(|error| error.contains("cancel"))
+                })
+            {
+                return Err("cancelled".to_string());
+            }
+            let arr = unsafe { GcRoot::new(vm, v.array(outputs.len())) };
+            for (index, output) in outputs.iter().enumerate() {
+                let child = unsafe { GcRoot::new(vm, tool_value_to_vm(vm, d, &tool_name, output)) };
+                let _ = v.set_index(arr.get(), index as u32, child.get());
+            }
+            Ok(arr.pop())
+        }
+        "evidence" => {
+            let kind = arg(0)
+                .and_then(|a| v.to_string(a).ok())
+                .ok_or("evidence(kind, ok, metadata?)")?;
+            let ok = arg(1)
+                .and_then(|a| v.to_json_scalar(a))
+                .and_then(|value| value.as_bool())
+                .ok_or("evidence(kind, ok, metadata?): ok must be boolean")?;
+            let metadata = arg(2)
+                .map(|a| vm_to_json(vm, a, d.budget.max_output_bytes))
+                .unwrap_or(Value::Null);
+            let evidence = evidence_record(d, kind, ok, &metadata);
+            d.state
+                .events
+                .lock()
+                .expect("event trace poisoned")
+                .push(PtcEvent::EvidenceRecorded { evidence });
+            Ok(v.undefined())
+        }
         "tr_read" => {
             let id = handle_id(&v, receiver)?;
             let offset = arg(0).and_then(|a| v.to_i64(a).ok()).unwrap_or(0) as usize;
@@ -517,6 +684,16 @@ unsafe fn run_host_call(
     }
 }
 
+fn ensure_direct_host_call(output: &Value) -> Result<(), String> {
+    let Some(error) = output.get("error").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if error.contains("budget exceeded") || error.contains("cancelled") {
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
 fn handle_id(v: &super::wrapper::ValueCtx, receiver: JSValue) -> Result<u64, String> {
     v.get(receiver, "id")
         .and_then(|id| v.to_i64(id).ok())
@@ -529,40 +706,240 @@ fn read_args(v: &super::wrapper::ValueCtx, a: Option<JSValue>) -> Result<Value, 
         Some(a) if v.is_string(a) => {
             Ok(json!({ "path": v.to_string(a).map_err(|e| e.to_string())? }))
         }
-        Some(a) => {
-            // argument object form
-            let vm = v.0;
-            let j = vm_to_json(vm, a, usize::MAX);
-            Ok(j)
-        }
+        Some(a) => Ok(vm_to_json(v.0, a, usize::MAX)),
         None => Err("read(path) or read({path})".to_string()),
     }
 }
 
-/// Routes `tool(name, args)` to the implementing function; native FC
-/// lowering reuses this exact path (spec invariant V).
-fn dispatch_tool(d: &DispatchBox, name: &str, args: &Value) -> Value {
-    let no_cancel = || d.state.cancelled.load(Ordering::Relaxed);
+fn execute_batch(d: &DispatchBox, name: &str, items: &[Value]) -> Vec<Value> {
+    if !matches!(name, "read" | "grep" | "glob" | "exec") {
+        return items
+            .iter()
+            .map(|_| json!({ "error": format!("tool '{name}' is not batch-safe") }))
+            .collect();
+    }
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let concurrency = d.budget.max_parallel_tools.max(1).min(items.len());
+    let next = AtomicUsize::new(0);
+    let outputs = Mutex::new(vec![Value::Null; items.len()]);
+    std::thread::scope(|scope| {
+        for _ in 0..concurrency {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= items.len() {
+                        break;
+                    }
+                    let output = execute_child(d, name, items[index].clone(), true);
+                    outputs.lock().expect("batch output poisoned")[index] = output;
+                }
+            });
+        }
+    });
+    outputs.into_inner().expect("batch output poisoned")
+}
+
+fn execute_child(d: &DispatchBox, name: &str, args: Value, count_budget: bool) -> Value {
+    let call_id = d.state.next_call_id.fetch_add(1, Ordering::Relaxed);
+    let args_hash = stable_args_hash(&args);
+    d.state
+        .events
+        .lock()
+        .expect("event trace poisoned")
+        .push(PtcEvent::HostCallStarted {
+            call_id,
+            name: name.to_string(),
+            args_hash,
+        });
+    let started = Instant::now();
+    let mut budget_error = None;
+    if count_budget {
+        let calls = d.state.tool_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if calls > d.state.max_tool_calls {
+            budget_error = Some("tool call budget exceeded");
+        }
+    }
+    if budget_error.is_none() && name == "exec" {
+        let processes = d.state.process_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if processes > d.state.max_processes {
+            budget_error = Some("process budget exceeded");
+        }
+    }
+    let output = if let Some(error) = budget_error {
+        json!({ "error": error })
+    } else if d.state.cancelled.load(Ordering::Relaxed) {
+        json!({ "error": "cancelled" })
+    } else {
+        match name {
+            "read" => fs_tools::read(d.caps, &args),
+            "write" => fs_tools::write(d.caps, &args),
+            "edit" => fs_tools::edit(d.caps, &args),
+            "glob" => fs_tools::glob(d.caps, &args),
+            "grep" => fs_tools::grep(d.caps, &args),
+            "exec" => fs_tools::exec(d.caps, d.store, &args, d.budget.max_result_bytes, &|| {
+                d.state.cancelled.load(Ordering::Relaxed)
+            }),
+            _ => json!({ "error": format!("unknown tool: {name}") }),
+        }
+    };
+    let duration_ms = elapsed_ms(started);
+    let mut output = output;
+    if name == "exec"
+        && output.get("error").is_none()
+        && let Some(object) = output.as_object_mut()
+    {
+        object.insert("durationMs".to_string(), json!(duration_ms));
+    }
+    let ok = output.get("error").is_none();
+    if ok && matches!(name, "write" | "edit") {
+        d.state.mutation_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+    let result_ids = result_ids(&output);
+    let paths = mutation_paths(name, &args, &output);
+    let error = output
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let outcome = if ok {
+        HostCallOutcome::Ok
+    } else if error.contains("cancel") {
+        HostCallOutcome::Cancelled
+    } else if error.contains("budget exceeded") {
+        HostCallOutcome::BudgetExceeded
+    } else {
+        HostCallOutcome::Error
+    };
+    d.state
+        .events
+        .lock()
+        .expect("event trace poisoned")
+        .push(PtcEvent::HostCallCompleted {
+            call_id,
+            name: name.to_string(),
+            args_hash,
+            effect: tool_effect(name),
+            outcome,
+            ok,
+            duration_ms,
+            result_ids,
+            paths,
+        });
+    output
+}
+
+fn tool_effect(name: &str) -> ToolEffect {
     match name {
-        "read" => fs_tools::read(d.caps, args),
-        "write" => fs_tools::write(d.caps, args),
-        "edit" => fs_tools::edit(d.caps, args),
-        "glob" => {
-            let output = fs_tools::glob(d.caps, args);
-            output.get("files").cloned().unwrap_or(output)
-        }
-        "grep" => {
-            let output = fs_tools::grep(d.caps, args);
-            output.get("matches").cloned().unwrap_or(output)
-        }
-        "exec" => {
-            let processes = d.state.process_calls.fetch_add(1, Ordering::Relaxed) + 1;
-            if processes > d.state.max_processes {
-                return json!({ "error": "process budget exceeded" });
+        "read" | "glob" | "grep" => ToolEffect::ReadOnly,
+        "write" | "edit" => ToolEffect::WorkspaceMutation,
+        "exec" => ToolEffect::Process,
+        _ => ToolEffect::Meta,
+    }
+}
+
+fn stable_args_hash(args: &Value) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in serde_json::to_vec(args).unwrap_or_default() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    hash
+}
+
+fn result_ids(output: &Value) -> Vec<ResultId> {
+    ["stdoutId", "stderrId", "resultId"]
+        .into_iter()
+        .filter_map(|key| output.get(key).and_then(Value::as_u64).map(ResultId))
+        .collect()
+}
+
+fn mutation_paths(name: &str, args: &Value, output: &Value) -> Vec<String> {
+    if !matches!(name, "write" | "edit") || output.get("error").is_some() {
+        return Vec::new();
+    }
+    args.get("path")
+        .and_then(Value::as_str)
+        .map(|path| vec![path.to_string()])
+        .unwrap_or_default()
+}
+
+fn evidence_record(d: &DispatchBox, kind: String, ok: bool, metadata: &Value) -> EvidenceRecord {
+    let mut ids = Vec::new();
+    collect_result_ids(d.store, metadata, &mut ids);
+    ids.sort_by_key(|id| id.0);
+    ids.dedup();
+    EvidenceRecord {
+        kind,
+        ok,
+        mutation_epoch: d.state.mutation_epoch.load(Ordering::Relaxed),
+        result_ids: ids,
+        note: metadata
+            .get("note")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        timestamp_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
+            .unwrap_or(0),
+    }
+}
+
+fn collect_result_ids(store: &ResultStore, value: &Value, ids: &mut Vec<ResultId>) {
+    match value {
+        Value::Number(number) => {
+            if let Some(id) = number.as_u64().map(ResultId)
+                && store.metadata(id).is_some()
+            {
+                ids.push(id);
             }
-            fs_tools::exec(d.caps, d.store, args, d.budget.max_result_bytes, &no_cancel)
         }
-        _ => json!({ "error": format!("unknown tool: {name}") }),
+        Value::Object(map) => map
+            .values()
+            .for_each(|value| collect_result_ids(store, value, ids)),
+        Value::Array(values) => values
+            .iter()
+            .for_each(|value| collect_result_ids(store, value, ids)),
+        _ => {}
+    }
+}
+
+fn collection_to_vm(vm: &Vm, output: &Value, key: &str) -> JSValue {
+    if output.get("error").is_some() {
+        return json_to_vm(vm, output);
+    }
+    let values = output
+        .get(key)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let v = vm.values();
+    let array = unsafe { GcRoot::new(vm, v.array(values.len())) };
+    for (index, value) in values.iter().enumerate() {
+        let child = unsafe { GcRoot::new(vm, json_to_vm(vm, value)) };
+        let _ = v.set_index(array.get(), index as u32, child.get());
+    }
+    let truncated = unsafe {
+        GcRoot::new(
+            vm,
+            v.bool(
+                output
+                    .get("truncated")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            ),
+        )
+    };
+    let _ = v.set(array.get(), "truncated", truncated.get());
+    array.pop()
+}
+
+fn tool_value_to_vm(vm: &Vm, d: &DispatchBox, name: &str, output: &Value) -> JSValue {
+    match name {
+        "glob" => collection_to_vm(vm, output, "files"),
+        "grep" => collection_to_vm(vm, output, "matches"),
+        "exec" => exec_result_to_vm(vm, d, output),
+        _ => json_to_vm(vm, output),
     }
 }
 
@@ -575,25 +952,34 @@ fn exec_result_to_vm(vm: &Vm, d: &DispatchBox, out: &Value) -> JSValue {
     }
     let obj = unsafe { GcRoot::new(vm, v.object()) };
     let exit = unsafe { GcRoot::new(vm, v.i64(out["exitCode"].as_i64().unwrap_or(-1))) };
+    let duration = unsafe { GcRoot::new(vm, v.i64(out["durationMs"].as_i64().unwrap_or(0))) };
     let _ = v.set(obj.get(), "exitCode", exit.get());
+    let _ = v.set(obj.get(), "durationMs", duration.get());
 
     let make_handle = |id: u64, key: &str| -> JSValue {
         let h = unsafe { GcRoot::new(vm, v.object()) };
         for method in ["read", "head", "tail", "grep", "json"] {
-            let dispatch_name = format!("tr_{method}");
-            let params = unsafe { GcRoot::new(vm, v.string(&dispatch_name)) };
+            let params = unsafe { GcRoot::new(vm, v.string(&format!("tr_{method}"))) };
             let method_fn = unsafe { GcRoot::new(vm, v.closure(params.get())) };
             let _ = v.set(h.get(), method, method_fn.get());
         }
+        let metadata = d.store.metadata(ResultId(id));
         let id_value = unsafe { GcRoot::new(vm, v.i64(i64::try_from(id).unwrap_or(i64::MAX))) };
         let kind = unsafe { GcRoot::new(vm, v.string(key)) };
-        let length_value = fs_tools::handle_length(d.store, id)
-            .and_then(|length| i64::try_from(length).ok())
-            .unwrap_or(0);
-        let length = unsafe { GcRoot::new(vm, v.i64(length_value)) };
+        let length =
+            unsafe { GcRoot::new(vm, v.i64(metadata.map(|m| m.length as i64).unwrap_or(0))) };
+        let total = unsafe {
+            GcRoot::new(
+                vm,
+                v.i64(metadata.map(|m| m.total_bytes as i64).unwrap_or(0)),
+            )
+        };
+        let truncated = unsafe { GcRoot::new(vm, v.bool(metadata.is_some_and(|m| m.truncated))) };
         let _ = v.set(h.get(), "id", id_value.get());
-        let _ = v.set(h.get(), "_kind", kind.get());
+        let _ = v.set(h.get(), "kind", kind.get());
         let _ = v.set(h.get(), "length", length.get());
+        let _ = v.set(h.get(), "totalBytes", total.get());
+        let _ = v.set(h.get(), "truncated", truncated.get());
         h.pop()
     };
 

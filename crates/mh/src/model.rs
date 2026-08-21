@@ -416,7 +416,7 @@ fn tool_definitions() -> Value {
     json!([{
         "type": "function",
         "name": "ptc",
-        "description": "Execute one bounded JavaScript Programmatic Tool Calling program inside the workspace sandbox. Use the program to call read, write, edit, glob, grep, or exec and return only compact evidence needed for the next inference.",
+        "description": "Execute one bounded synchronous JavaScript Programmatic Tool Calling program inside the workspace sandbox. The program may call tool, read, write, edit, glob, grep, exec, batch(name, args[]) for bounded parallel batch-safe host calls, and evidence(kind, ok, metadata?) to record verification. Return only compact evidence needed for the next inference; result handles expose id, length, totalBytes, truncated, kind, and bounded read/head/tail/grep/json methods.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -502,6 +502,10 @@ mod tests {
                 .and_then(Value::as_str),
             Some("string")
         );
+        let description = tool.get("description").and_then(Value::as_str).unwrap();
+        assert!(description.contains("batch(name, args[])"));
+        assert!(description.contains("evidence(kind, ok, metadata?)"));
+        assert!(description.contains("totalBytes"));
     }
 
     #[test]

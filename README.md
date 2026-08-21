@@ -1,7 +1,7 @@
 # mh
 
-Minimal PTC-first coding-agent harness implemented in Rust with an embedded
-MicroQuickJS runtime.
+Traceable, parallel, steerable PTC workflow runtime implemented in Rust with an
+embedded MicroQuickJS runtime.
 
 ## Build
 
@@ -31,8 +31,8 @@ status. Reasoning summaries are not the model's private raw chain-of-thought.
 
 The model-facing Responses API exposes exactly one function: `ptc({ source })`.
 Its `source` is executed inside bounded MicroQuickJS. Filesystem and process
-operations are not separate provider functions; they are host calls available
-only inside that PTC program.
+operations are synchronous host calls available only inside that PTC program;
+host-side `batch()` supplies bounded parallelism without Promise or async JavaScript.
 
 ## Use
 
@@ -43,8 +43,11 @@ mh resume                  # resume the durable workspace session
 mh sessions                # inspect session status and the last answer
 ```
 
-Session state is stored under `.mh/` in the current workspace. Tool access is
-confined to that workspace. Press Ctrl-C to cancel model, PTC, or process work.
+Session state, compact host-call traces, working state, and verification evidence
+are stored under `.mh/` in the current workspace. Filesystem tools are confined
+to that workspace, including symlink-safe writes. Subprocesses start in the
+workspace with normal host OS capabilities; provider API keys are removed from
+their environment. Press Ctrl-C to cancel model, PTC, batch, or process work.
 
 ## PTC runtime
 
@@ -61,9 +64,15 @@ return tool("read", { path: "Cargo.toml" });
 ```
 
 Convenience globals are also available inside PTC: `read`, `write`, `edit`,
-`glob`, `grep`, `exec`, `call_tool`, and `tools.*`. Here `exec` starts an argv-
-based OS subprocess; it does not execute the PTC program itself. `read(path)`
-returns `{ path, content, totalLines, truncated }`; file text is in `.content`.
-`glob(pattern)` returns a string array and `grep(args)` returns a match array.
-Large tool output is stored as handle-backed results instead of being inserted
-into model context directly.
+`glob`, `grep`, `exec`, `batch`, `evidence`, `call_tool`, and `tools.*`. Here
+`exec` starts an argv-based OS subprocess; it does not execute the PTC program
+itself. `batch(name, args)` runs bounded parallel `read`, `grep`, `glob`, or
+`exec` calls and preserves input ordering. `evidence(kind, ok, metadata)` records
+verification against the current workspace mutation epoch.
+
+`read(path)` returns `{ path, content, totalLines, truncated }`; file text is in
+`.content`. `glob(pattern)` returns a string array and `grep(args)` returns a
+match array; both arrays expose `.truncated`. Large subprocess output is stored
+as handle-backed results instead of entering model context directly. Handles
+provide `.read()`, `.head()`, `.tail()`, `.grep()`, `.json()`, plus `.id`,
+`.length`, `.totalBytes`, `.truncated`, and `.kind` metadata.
