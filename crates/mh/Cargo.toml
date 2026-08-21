@@ -5,7 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[lints]
-workspace = true
+[lints.rust]
+# ptc/runtime.rs is the deliberate FFI boundary.
+unsafe_code = "allow"
 
 [dependencies]
+mh-quickjs-sys = { path = "../mh-quickjs-sys" }
+
+ctrlc = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "mh"
+path = "src/main.rs"

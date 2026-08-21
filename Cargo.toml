@@ -7,8 +7,10 @@ edition = "2024"
 rust-version = "1.97"
 license = "MIT"
 
+# The PTC runtime is an FFI boundary and uses `unsafe` deliberately.
+# Crates without FFI (mh) keep `forbid` locally.
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "warn"
 
 [workspace.lints.clippy]
 all = "warn"

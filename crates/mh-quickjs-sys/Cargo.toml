@@ -1,0 +1,20 @@
+[package]
+name = "mh-quickjs-sys"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+build = "build.rs"
+links = "mquickjs"
+
+# This crate embeds MicroQuickJS via FFI and intentionally opts out of the
+# workspace `unsafe_code = "forbid"` lint. All other lints are kept.
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[build-dependencies]
+cc = "1"
