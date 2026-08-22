@@ -65,6 +65,49 @@ fn execute(
 }
 
 #[test]
+fn read_only_capabilities_disable_mutation_process_and_restore() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+    let tracker_impl = WorkspaceTrackerImpl::open(dir.path()).unwrap();
+    let start_revision = tracker_impl.current_revision().unwrap().id;
+    let tracker: Arc<dyn WorkspaceTracker> = Arc::new(tracker_impl);
+    let runtime = PtcRuntime::new(
+        Capabilities::read_only(dir.path()),
+        ResultStore::new(),
+        PtcBudget::default(),
+        tracker.clone(),
+        CheckpointStore::open(dir.path(), tracker).unwrap(),
+    );
+    let result = runtime.execute(
+        r#"
+        var readResult = read("a.txt");
+        var writeResult = tool("write", {path: "blocked.txt", content: "bad"});
+        var execResult = exec({command: ["/usr/bin/touch", "also-blocked.txt"]});
+        var checkpointResult = checkpoint();
+        return {read: readResult.content, write: writeResult, exec: execResult,
+                checkpoint: checkpointResult};
+        "#,
+        Arc::new(AtomicBool::new(false)),
+        PtcExecution {
+            task_id: TaskId(2),
+            execution_id: ExecutionId(2),
+            start_revision,
+        },
+        None,
+    );
+    assert_eq!(result.outcome, PtcOutcome::Completed);
+    assert_eq!(result.value["read"], "alpha");
+    assert_eq!(result.value["write"]["error"], "write: disabled by policy");
+    assert_eq!(result.value["exec"]["error"], "exec: disabled by policy");
+    assert_eq!(
+        result.value["checkpoint"]["error"],
+        "checkpoint: disabled by policy"
+    );
+    assert!(!dir.path().join("blocked.txt").exists());
+    assert!(!dir.path().join("also-blocked.txt").exists());
+}
+
+#[test]
 fn pure_js_evaluates() {
     let dir = tempfile::tempdir().unwrap();
     let r = run(dir.path(), "var x = 1 + 2; return x * 2;");
