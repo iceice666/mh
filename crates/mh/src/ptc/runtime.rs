@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::checkpoint::{Checkpoint, CheckpointStore};
+use crate::delegation::{DelegationHost, DelegationOptions};
 use crate::identity::{ExecutionId, RevisionId, TaskId};
 use crate::session::EvidenceRecord;
 use crate::tools::capability::Capabilities;
@@ -267,6 +268,7 @@ pub struct PtcRuntime {
     budget: PtcBudget,
     tracker: Arc<dyn WorkspaceTracker>,
     checkpoints: CheckpointStore,
+    delegation: Option<Arc<dyn DelegationHost>>,
 }
 
 impl PtcRuntime {
@@ -283,9 +285,14 @@ impl PtcRuntime {
             budget,
             tracker,
             checkpoints,
+            delegation: None,
         }
     }
 
+    pub fn with_delegation(mut self, delegation: Arc<dyn DelegationHost>) -> Self {
+        self.delegation = Some(delegation);
+        self
+    }
     pub fn execute(
         &self,
         program: &str,
@@ -332,6 +339,7 @@ impl PtcRuntime {
             budget: &self.budget,
             tracker: self.tracker.as_ref(),
             checkpoints: &self.checkpoints,
+            delegation: self.delegation.as_deref(),
         });
         let dispatch_ptr = Box::into_raw(dispatch);
         unsafe { vm.install_opaque(dispatch_ptr.cast::<c_void>(), interrupt_handler) };
@@ -441,6 +449,9 @@ impl PtcRuntime {
             "grep",
             "exec",
             "batch",
+            "delegate",
+            "delegate_batch",
+            "integrate",
             "evidence",
             "checkpoint",
             "restore",
@@ -459,6 +470,9 @@ impl PtcRuntime {
             "exec",
             "call_tool",
             "batch",
+            "delegate",
+            "delegate_batch",
+            "integrate",
             "evidence",
             "checkpoint",
             "restore",
@@ -560,6 +574,7 @@ struct DispatchBox<'a> {
     budget: &'a PtcBudget,
     tracker: &'a dyn WorkspaceTracker,
     checkpoints: &'a CheckpointStore,
+    delegation: Option<&'a dyn DelegationHost>,
 }
 
 fn instruction_budget_exceeded(p: *mut DispatchBox) -> bool {
@@ -738,6 +753,74 @@ unsafe fn run_host_call(
             }
             Ok(arr.pop())
         }
+        "delegate" => {
+            let host = d
+                .delegation
+                .ok_or("delegate: unavailable in child execution")?;
+            let options = arg(0).ok_or("delegate(options)")?;
+            let options: DelegationOptions =
+                serde_json::from_value(vm_to_json(vm, options, d.budget.max_output_bytes))
+                    .map_err(|error| format!("delegate: invalid options: {error}"))?;
+            let revision = d
+                .state
+                .current_revision
+                .lock()
+                .expect("revision poisoned")
+                .clone();
+            Ok(json_to_vm(
+                vm,
+                &serde_json::to_value(host.delegate(&d.state.execution, &revision, options))
+                    .unwrap(),
+            ))
+        }
+        "delegate_batch" => {
+            let host = d
+                .delegation
+                .ok_or("delegate_batch: unavailable in child execution")?;
+            let options = arg(0).ok_or("delegate_batch(options[])")?;
+            let options: Vec<DelegationOptions> =
+                serde_json::from_value(vm_to_json(vm, options, d.budget.max_output_bytes))
+                    .map_err(|error| format!("delegate_batch: invalid options: {error}"))?;
+            let revision = d
+                .state
+                .current_revision
+                .lock()
+                .expect("revision poisoned")
+                .clone();
+            Ok(json_to_vm(
+                vm,
+                &serde_json::to_value(host.delegate_batch(&d.state.execution, &revision, options))
+                    .unwrap(),
+            ))
+        }
+        "integrate" => {
+            let host = d
+                .delegation
+                .ok_or("integrate: unavailable in child execution")?;
+            let workspace = arg(0).ok_or("integrate(workspace)")?;
+            let workspace = vm_to_json(vm, workspace, d.budget.max_output_bytes);
+            let id = workspace
+                .get("id")
+                .and_then(Value::as_u64)
+                .or_else(|| workspace.as_u64())
+                .ok_or("integrate: workspace id required")?;
+            let revision = d
+                .state
+                .current_revision
+                .lock()
+                .expect("revision poisoned")
+                .clone();
+            let response = host.integrate(
+                &d.state.execution,
+                &revision,
+                crate::identity::IsolatedWorkspaceId(id),
+            );
+            if let Some(parent_revision) = response.parent_revision.as_ref() {
+                *d.state.current_revision.lock().expect("revision poisoned") =
+                    parent_revision.clone();
+            }
+            Ok(json_to_vm(vm, &serde_json::to_value(response).unwrap()))
+        }
         "evidence" => {
             let kind = arg(0)
                 .and_then(|a| v.to_string(a).ok())
@@ -893,13 +976,18 @@ fn execute_child(d: &DispatchBox, name: &str, args: Value, count_budget: bool) -
     } else {
         match name {
             "read" => fs_tools::read(d.caps, &args),
-            "write" => fs_tools::write(d.caps, &args),
-            "edit" => fs_tools::edit(d.caps, &args),
+            "write" if d.caps.can_write_workspace() => fs_tools::write(d.caps, &args),
+            "write" => json!({ "error": "write: disabled by policy" }),
+            "edit" if d.caps.can_write_workspace() => fs_tools::edit(d.caps, &args),
+            "edit" => json!({ "error": "edit: disabled by policy" }),
             "glob" => fs_tools::glob(d.caps, &args),
             "grep" => fs_tools::grep(d.caps, &args),
             "exec" => fs_tools::exec(d.caps, d.store, &args, d.budget.max_result_bytes, &|| {
                 d.state.cancelled.load(Ordering::Relaxed)
             }),
+            "checkpoint" if !d.caps.can_write_workspace() => {
+                json!({ "error": "checkpoint: disabled by policy" })
+            }
             "checkpoint" => match d.checkpoints.create(execution.task_id) {
                 Ok(checkpoint) => {
                     d.state
@@ -911,6 +999,9 @@ fn execute_child(d: &DispatchBox, name: &str, args: Value, count_budget: bool) -
                 }
                 Err(error) => json!({ "error": error.to_string() }),
             },
+            "restore" if !d.caps.can_write_workspace() => {
+                json!({ "error": "restore: disabled by policy" })
+            }
             "restore" => {
                 let id = args.get("id").and_then(Value::as_u64);
                 let revision = args.get("revision").and_then(Value::as_str);

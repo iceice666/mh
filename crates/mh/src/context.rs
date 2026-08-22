@@ -124,10 +124,18 @@ impl ContextCompiler {
             matches!(record.event, SessionEvent::AssistantMessage { .. }).then_some(record.seq)
         });
         let latest_completed_seq = session.events().iter().rev().find_map(|record| {
-            matches!(record.event, SessionEvent::PtcCompleted { .. }).then_some(record.seq)
+            matches!(
+                record.event,
+                SessionEvent::PtcCompleted { task_id, .. } if Some(task_id) == work.task_id
+            )
+            .then_some(record.seq)
         });
         let latest_failed_seq = session.events().iter().rev().find_map(|record| {
-            matches!(record.event, SessionEvent::PtcFailed { .. }).then_some(record.seq)
+            matches!(
+                record.event,
+                SessionEvent::PtcFailed { task_id, .. } if Some(task_id) == work.task_id
+            )
+            .then_some(record.seq)
         });
         let dialogue_start = session
             .events()
@@ -155,6 +163,78 @@ impl ContextCompiler {
             }
         }
         self.select(candidates)
+    }
+
+    pub fn compile_child(
+        &self,
+        objective: &str,
+        parent_context: &serde_json::Value,
+        workspace: &crate::workspace::WorkspaceRevision,
+        access: crate::delegation::DelegationAccess,
+    ) -> Result<CompiledContext, ContextError> {
+        self.select(vec![
+            item(
+                ContextSource::System,
+                Priority::Hard,
+                format!(
+                    "[system]\n{}\n\nYou are a delegated child execution. Delegation depth is one: delegate and integrate are unavailable. Return a compact final result, not a transcript. Access mode: {:?}.",
+                    self.system_prompt, access
+                ),
+            ),
+            item(
+                ContextSource::Task,
+                Priority::Hard,
+                format!("[delegated objective]\n{objective}"),
+            ),
+            item(
+                ContextSource::CurrentInstruction,
+                Priority::Working,
+                format!(
+                    "[parent-provided context]\n{}",
+                    bounded_json(parent_context, 8 * 1024)
+                ),
+            ),
+            item(
+                ContextSource::WorkState,
+                Priority::Sticky,
+                format!(
+                    "[workspace state]\nrevision: {}\nchanged paths: none",
+                    workspace.id.0
+                ),
+            ),
+        ])
+    }
+
+    pub fn compile_child_followup(
+        &self,
+        objective: &str,
+        parent_context: &serde_json::Value,
+        workspace: &crate::workspace::WorkspaceRevision,
+        access: crate::delegation::DelegationAccess,
+        latest_result: &serde_json::Value,
+        latest_error: Option<&str>,
+    ) -> Result<CompiledContext, ContextError> {
+        let mut context = self.compile_child(objective, parent_context, workspace, access)?;
+        let content = latest_error.map_or_else(
+            || {
+                format!(
+                    "[latest child PTC result]\n{}",
+                    bounded_json(latest_result, 16 * 1024)
+                )
+            },
+            |error| {
+                format!(
+                    "[latest child PTC failure]\n{error}\n{}",
+                    bounded_json(latest_result, 8 * 1024)
+                )
+            },
+        );
+        context.items.push(item(
+            ContextSource::SessionEvent(0),
+            Priority::Working,
+            content,
+        ));
+        self.select(context.items)
     }
 
     pub fn select(&self, candidates: Vec<ContextItem>) -> Result<CompiledContext, ContextError> {
@@ -367,11 +447,14 @@ PTC JavaScript uses var/function/return/if/for/while and these synchronous globa
 - grep({pattern, path|paths, max?}) -> match[] with `.truncated`
 - exec({command: [program, ...args], timeout_ms?})
 - batch(name, args[]) — bounded parallel read/grep/glob/exec; preserves input order and isolates item errors
+- delegate({task, access, context?}) — independent model reasoning with read or isolated-write workspace access
+- delegate_batch(options[]) — bounded parallel independent reasoning; preserves input order
+- integrate(workspace) — explicitly apply an isolated child delta or return a structured conflict
 - evidence(kind, ok, metadata?) — record verification against the current workspace revision
 - checkpoint() -> {id, revision} — explicitly capture the current workspace state
 - restore(checkpoint) — explicitly restore a checkpoint; restoration is never automatic
 
-The same checkpoint and restore operations are available through tool("checkpoint", {}) and tool("restore", {checkpoint}). Use one PTC program for related work. Use batch() for independent batch-safe operations; do not emulate concurrency with Promise or async JavaScript. write/edit/restore are not batch-safe. exec runs an OS subprocess; it is not the provider PTC entry point.
+The same checkpoint and restore operations are available through tool("checkpoint", {}) and tool("restore", {checkpoint}). Use one PTC program for related work. Use batch() for procedural independent host operations. Use delegate() only for independent model reasoning; children receive bounded context rather than the parent conversation. isolated-write work never changes the parent until integrate(). After integration, re-run verification in the parent because child evidence remains attributed to the child revision. Do not emulate concurrency with Promise or async JavaScript. write/edit/restore are not batch-safe. exec runs an OS subprocess; it is not the provider PTC entry point.
 
 exec returns {exitCode, durationMs, stdout, stderr}. stdout/stderr are handles with:
 .read(offset?, limit?), .head(n), .tail(n), .grep(pattern, limit?), .json(),

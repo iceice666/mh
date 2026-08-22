@@ -11,3 +11,6 @@ pub struct RevisionId(pub String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CheckpointId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct IsolatedWorkspaceId(pub u64);

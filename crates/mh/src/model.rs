@@ -460,7 +460,7 @@ fn tool_definitions() -> Value {
     json!([{
         "type": "function",
         "name": "ptc",
-        "description": "Execute one bounded synchronous JavaScript Programmatic Tool Calling program inside the workspace sandbox. The program may call tool, read, write, edit, glob, grep, exec, batch(name, args[]) for bounded parallel batch-safe host calls, evidence(kind, ok, metadata?) to record verification, checkpoint() to capture the current workspace revision, and restore(checkpoint) to explicitly restore one. Return only compact evidence needed for the next inference; result handles expose id, length, totalBytes, truncated, kind, and bounded read/head/tail/grep/json methods.",
+        "description": "Execute one bounded synchronous JavaScript Programmatic Tool Calling program inside the workspace sandbox. The program may call tool, read, write, edit, glob, grep, exec, batch(name, args[]) for procedural parallel host calls, delegate({task, access, context?}) or delegate_batch(options[]) for bounded independent model reasoning, integrate(workspace) for explicit isolated change integration, evidence(kind, ok, metadata?) to record verification, checkpoint() to capture the current workspace revision, and restore(checkpoint) to explicitly restore one. Return only compact evidence needed for the next inference; result handles expose id, length, totalBytes, truncated, kind, and bounded read/head/tail/grep/json methods.",
         "parameters": {
             "type": "object",
             "properties": {

@@ -12,7 +12,9 @@
 pub mod agent;
 pub mod checkpoint;
 pub mod context;
+pub mod delegation;
 pub mod identity;
+pub mod isolation;
 pub mod model;
 pub mod ptc;
 pub mod session;

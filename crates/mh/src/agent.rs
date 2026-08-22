@@ -10,6 +10,12 @@ use std::time::Duration;
 
 use crate::checkpoint::{CheckpointError, CheckpointStore};
 use crate::context::{ContextCompiler, ContextError};
+use crate::delegation::{
+    DelegateResult, DelegationAccess, DelegationBudget, DelegationHost, DelegationOptions,
+    IntegrationResponse,
+};
+use crate::identity::{ExecutionId, IsolatedWorkspaceId, RevisionId, TaskId};
+use crate::isolation::{IntegrationResult, IsolationStore};
 use crate::model::{
     GenerationStop, GenerationStopReason, Model, ModelError, ModelEvent, ModelOutput, lower,
 };
@@ -26,6 +32,7 @@ pub struct AgentConfig {
     pub max_turns: usize,
     pub context_tokens: usize,
     pub ptc_budget: PtcBudget,
+    pub delegation_budget: DelegationBudget,
 }
 
 impl Default for AgentConfig {
@@ -34,6 +41,7 @@ impl Default for AgentConfig {
             max_turns: 32,
             context_tokens: 32_000,
             ptc_budget: PtcBudget::default(),
+            delegation_budget: DelegationBudget::default(),
         }
     }
 }
@@ -135,19 +143,19 @@ impl From<ContextError> for AgentError {
 }
 
 pub struct Agent<M> {
-    model: M,
+    model: Arc<M>,
     compiler: ContextCompiler,
     config: AgentConfig,
 }
 
-impl<M: Model> Agent<M> {
+impl<M: Model + 'static> Agent<M> {
     pub fn new(model: M, config: AgentConfig) -> Self {
         let compiler = ContextCompiler {
             max_tokens: config.context_tokens,
             ..ContextCompiler::default()
         };
         Self {
-            model,
+            model: Arc::new(model),
             compiler,
             config,
         }
@@ -267,7 +275,14 @@ impl<M: Model> Agent<M> {
             self.config.ptc_budget.clone(),
             tracker,
             checkpoints,
-        );
+        )
+        .with_delegation(Arc::new(AgentDelegationHost::new(
+            self.model.clone(),
+            self.compiler.clone(),
+            self.config.clone(),
+            session.clone(),
+            cancelled.clone(),
+        )));
         let mut repeated = RepeatState::default();
 
         for _turn in 0..self.config.max_turns {
@@ -442,6 +457,494 @@ impl<M: Model> Agent<M> {
                 }
             }
         })
+    }
+}
+
+struct AgentDelegationHost<M> {
+    model: Arc<M>,
+    compiler: ContextCompiler,
+    config: AgentConfig,
+    session: Session,
+    cancelled: Arc<AtomicBool>,
+    isolation: Option<IsolationStore>,
+    owner_task_id: std::sync::atomic::AtomicU64,
+    children_started: std::sync::atomic::AtomicUsize,
+    active_children: std::sync::atomic::AtomicUsize,
+    next_child_task: std::sync::atomic::AtomicU64,
+    next_child_execution: std::sync::atomic::AtomicU64,
+    next_workspace: std::sync::atomic::AtomicU64,
+}
+
+impl<M> Drop for AgentDelegationHost<M> {
+    fn drop(&mut self) {
+        let owner = self.owner_task_id.load(Ordering::Relaxed);
+        if owner == 0 {
+            return;
+        }
+        if let Some(isolation) = self.isolation.as_ref() {
+            let _ = isolation.cleanup_owner(TaskId(owner));
+        }
+    }
+}
+
+impl<M: Model> AgentDelegationHost<M> {
+    fn new(
+        model: Arc<M>,
+        compiler: ContextCompiler,
+        config: AgentConfig,
+        session: Session,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
+        let isolation = IsolationStore::open(session.workspace_root()).ok();
+        let (next_task, next_execution) = session.allocate_child_ids();
+        let next_workspace = session.next_isolated_workspace_id();
+        Self {
+            model,
+            compiler,
+            config,
+            session,
+            cancelled,
+            isolation,
+            owner_task_id: std::sync::atomic::AtomicU64::new(0),
+            children_started: std::sync::atomic::AtomicUsize::new(0),
+            active_children: std::sync::atomic::AtomicUsize::new(0),
+            next_child_task: std::sync::atomic::AtomicU64::new(next_task.0),
+            next_child_execution: std::sync::atomic::AtomicU64::new(next_execution.0),
+            next_workspace: std::sync::atomic::AtomicU64::new(next_workspace.0),
+        }
+    }
+
+    fn failure(
+        task_id: TaskId,
+        execution_id: ExecutionId,
+        revision: RevisionId,
+        summary: impl Into<String>,
+    ) -> DelegateResult {
+        DelegateResult {
+            task_id,
+            execution_id,
+            ok: false,
+            summary: summary.into(),
+            base_revision: revision.clone(),
+            final_revision: revision,
+            changed: false,
+            workspace: None,
+            evidence: Vec::new(),
+            findings: serde_json::Value::Null,
+        }
+    }
+
+    fn run_child(
+        &self,
+        parent: &PtcExecution,
+        revision: &RevisionId,
+        options: DelegationOptions,
+    ) -> DelegateResult {
+        let index = self.children_started.fetch_add(1, Ordering::Relaxed);
+        let task_id = TaskId(self.next_child_task.fetch_add(1, Ordering::Relaxed));
+        let execution_id = ExecutionId(self.next_child_execution.fetch_add(1, Ordering::Relaxed));
+        if index >= self.config.delegation_budget.max_children {
+            return Self::failure(
+                task_id,
+                execution_id,
+                revision.clone(),
+                "delegation child budget exceeded",
+            );
+        }
+        let active = self.active_children.fetch_add(1, Ordering::AcqRel) + 1;
+        if active > self.config.delegation_budget.max_parallel_children.max(1) {
+            self.active_children.fetch_sub(1, Ordering::AcqRel);
+            return Self::failure(
+                task_id,
+                execution_id,
+                revision.clone(),
+                "parallel delegation budget exceeded",
+            );
+        }
+        struct ActiveGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for ActiveGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        let _guard = ActiveGuard(&self.active_children);
+        let started = SessionEvent::DelegationStarted {
+            parent_task_id: parent.task_id,
+            parent_execution_id: parent.execution_id,
+            child_task_id: task_id,
+            child_execution_id: execution_id,
+            access: options.access,
+            base_revision: revision.clone(),
+        };
+        if let Err(error) = self.session.append_shared_event(started) {
+            return Self::failure(task_id, execution_id, revision.clone(), error.to_string());
+        }
+        let workspace_id = (options.access == DelegationAccess::IsolatedWrite)
+            .then(|| IsolatedWorkspaceId(self.next_workspace.fetch_add(1, Ordering::Relaxed)));
+        self.owner_task_id
+            .store(parent.task_id.0, Ordering::Relaxed);
+        let workspace_record = match workspace_id {
+            Some(id) => match self.isolation.as_ref().map_or_else(
+                || Err("isolated-write requires a Git-root workspace".to_string()),
+                |isolation| {
+                    isolation
+                        .create(id, parent.task_id, execution_id, revision.clone())
+                        .map_err(|error| error.to_string())
+                },
+            ) {
+                Ok(record) => Some(record),
+                Err(error) => {
+                    let result =
+                        Self::failure(task_id, execution_id, revision.clone(), error.to_string());
+                    let _ = self
+                        .session
+                        .append_shared_event(SessionEvent::DelegationCompleted {
+                            parent_task_id: parent.task_id,
+                            parent_execution_id: parent.execution_id,
+                            result: result.clone(),
+                        });
+                    return result;
+                }
+            },
+            None => None,
+        };
+        let workspace = workspace_record.as_ref().map_or_else(
+            || self.session.workspace_root(),
+            |record| record.path.clone(),
+        );
+        let tracker_impl = match WorkspaceTrackerImpl::open(&workspace) {
+            Ok(tracker) => tracker,
+            Err(error) => {
+                return Self::failure(task_id, execution_id, revision.clone(), error.to_string());
+            }
+        };
+        let tracker: Arc<dyn WorkspaceTracker> = Arc::new(tracker_impl);
+        let child_revision = match tracker.current_revision() {
+            Ok(child_revision) => child_revision,
+            Err(error) => {
+                return Self::failure(task_id, execution_id, revision.clone(), error.to_string());
+            }
+        };
+        if child_revision.id != *revision {
+            return Self::failure(
+                task_id,
+                execution_id,
+                revision.clone(),
+                format!(
+                    "delegation base revision changed before child start: expected {}, found {}",
+                    revision.0, child_revision.id.0
+                ),
+            );
+        }
+        let checkpoints = match CheckpointStore::open(&workspace, tracker.clone()) {
+            Ok(checkpoints) => checkpoints,
+            Err(error) => {
+                return Self::failure(task_id, execution_id, revision.clone(), error.to_string());
+            }
+        };
+        let capabilities = match options.access {
+            DelegationAccess::Read => Capabilities::read_only(&workspace),
+            DelegationAccess::IsolatedWrite => Capabilities::new(&workspace),
+        };
+        let runtime = PtcRuntime::new(
+            capabilities,
+            match self.session.result_store() {
+                Ok(store) => store,
+                Err(error) => {
+                    return Self::failure(
+                        task_id,
+                        execution_id,
+                        revision.clone(),
+                        error.to_string(),
+                    );
+                }
+            },
+            self.config.ptc_budget.clone(),
+            tracker.clone(),
+            checkpoints,
+        );
+        let sink: Arc<dyn PtcEventSink> = Arc::new(self.session.child_ptc_event_sink(workspace_id));
+        let mut context = match self.compiler.compile_child(
+            &options.task,
+            &options.context,
+            &child_revision,
+            options.access,
+        ) {
+            Ok(context) => context,
+            Err(error) => {
+                return Self::failure(task_id, execution_id, revision.clone(), error.to_string());
+            }
+        };
+        let mut summary = None;
+        let mut last_value = serde_json::Value::Null;
+        let mut last_error = None;
+        let turns = self.config.delegation_budget.max_child_turns.max(1);
+        for _ in 0..turns {
+            if self.cancelled.load(Ordering::Relaxed) {
+                let _ = self
+                    .session
+                    .append_shared_event(SessionEvent::DelegationCancelled {
+                        parent_task_id: parent.task_id,
+                        parent_execution_id: parent.execution_id,
+                        child_task_id: task_id,
+                        child_execution_id: execution_id,
+                    });
+                return Self::failure(task_id, execution_id, revision.clone(), "cancelled");
+            }
+            let stop = GenerationStop::new(self.cancelled.clone());
+            let output = match self.model.generate(&context, &stop, &mut |_| {}) {
+                Ok(output) => output,
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    break;
+                }
+            };
+            match output {
+                ModelOutput::Text(text) => {
+                    summary = Some(text);
+                    break;
+                }
+                executable => {
+                    let source = lower(&executable).expect("executable child output lowers to PTC");
+                    let current = match tracker.current_revision() {
+                        Ok(revision) => revision,
+                        Err(error) => {
+                            last_error = Some(error.to_string());
+                            break;
+                        }
+                    };
+                    let execution = PtcExecution {
+                        task_id,
+                        execution_id,
+                        start_revision: current.id,
+                    };
+                    let result = runtime.execute(
+                        &source,
+                        self.cancelled.clone(),
+                        execution,
+                        Some(sink.clone()),
+                    );
+                    let _ = self.session.append_child_ptc_result(&result);
+                    last_value = result.value.clone();
+                    last_error = match &result.outcome {
+                        PtcOutcome::Completed => None,
+                        PtcOutcome::Interrupted => Some("cancelled".to_string()),
+                        PtcOutcome::BudgetExceeded(kind) => {
+                            Some(format!("budget exceeded: {kind}"))
+                        }
+                        PtcOutcome::Failed(error) => Some(error.clone()),
+                    };
+                    let current = match tracker.current_revision() {
+                        Ok(revision) => revision,
+                        Err(error) => {
+                            last_error = Some(error.to_string());
+                            break;
+                        }
+                    };
+                    context = match self.compiler.compile_child_followup(
+                        &options.task,
+                        &options.context,
+                        &current,
+                        options.access,
+                        &last_value,
+                        last_error.as_deref(),
+                    ) {
+                        Ok(context) => context,
+                        Err(error) => {
+                            last_error = Some(error.to_string());
+                            break;
+                        }
+                    };
+                }
+            }
+        }
+        let final_record = workspace_id.and_then(|id| {
+            self.isolation
+                .as_ref()
+                .and_then(|isolation| isolation.finalize(id).ok())
+        });
+        let final_revision = final_record
+            .as_ref()
+            .map(|record| record.final_revision.clone())
+            .or_else(|| tracker.current_revision().ok().map(|revision| revision.id))
+            .unwrap_or_else(|| revision.clone());
+        let changed = final_revision != *revision;
+        let ok = summary.is_some();
+        let result = DelegateResult {
+            task_id,
+            execution_id,
+            ok,
+            summary: summary.unwrap_or_else(|| {
+                last_error.unwrap_or_else(|| format!("child reached {turns} model turns"))
+            }),
+            base_revision: revision.clone(),
+            final_revision,
+            changed,
+            workspace: final_record.as_ref().map(|record| record.id),
+            evidence: self.session.evidence_for_execution(execution_id),
+            findings: {
+                let encoded = serde_json::to_vec(&last_value).unwrap_or_default();
+                if encoded.len() <= self.config.delegation_budget.max_findings_bytes {
+                    last_value
+                } else {
+                    serde_json::json!({
+                        "truncated": true,
+                        "bytes": encoded.len(),
+                    })
+                }
+            },
+        };
+        let _ = self
+            .session
+            .append_shared_event(SessionEvent::DelegationCompleted {
+                parent_task_id: parent.task_id,
+                parent_execution_id: parent.execution_id,
+                result: result.clone(),
+            });
+        result
+    }
+}
+
+impl<M: Model> DelegationHost for AgentDelegationHost<M> {
+    fn delegate(
+        &self,
+        parent: &PtcExecution,
+        revision: &RevisionId,
+        options: DelegationOptions,
+    ) -> DelegateResult {
+        self.run_child(parent, revision, options)
+    }
+
+    fn delegate_batch(
+        &self,
+        parent: &PtcExecution,
+        revision: &RevisionId,
+        options: Vec<DelegationOptions>,
+    ) -> Vec<DelegateResult> {
+        let limit = self.config.delegation_budget.max_parallel_children.max(1);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let output = std::sync::Mutex::new(vec![None; options.len()]);
+        std::thread::scope(|scope| {
+            for _ in 0..limit.min(options.len()) {
+                scope.spawn(|| {
+                    loop {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
+                        if index >= options.len() {
+                            break;
+                        }
+                        let result = self.run_child(parent, revision, options[index].clone());
+                        output.lock().expect("delegate output poisoned")[index] = Some(result);
+                    }
+                });
+            }
+        });
+        output
+            .into_inner()
+            .expect("delegate output poisoned")
+            .into_iter()
+            .map(|result| result.expect("delegate worker filled every result"))
+            .collect()
+    }
+
+    fn integrate(
+        &self,
+        parent: &PtcExecution,
+        revision: &RevisionId,
+        workspace: IsolatedWorkspaceId,
+    ) -> IntegrationResponse {
+        let Some(isolation) = self.isolation.as_ref() else {
+            return IntegrationResponse::error("integration requires a Git-root workspace");
+        };
+        let record = match isolation.load(workspace) {
+            Ok(record) => record,
+            Err(error) => return IntegrationResponse::error(error.to_string()),
+        };
+        let _ = self
+            .session
+            .append_shared_event(SessionEvent::IntegrationStarted {
+                parent_task_id: parent.task_id,
+                parent_execution_id: parent.execution_id,
+                workspace,
+                child_execution_id: record.owner_execution_id,
+                child_base: record.base_revision.clone(),
+                parent_base: revision.clone(),
+            });
+        match isolation.integrate(workspace) {
+            Ok(IntegrationResult::Applied {
+                previous_revision,
+                current_revision,
+                changed_paths,
+            }) => {
+                let paths = changed_paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                let _ = self
+                    .session
+                    .append_shared_event(SessionEvent::WorkspaceRevisionChanged {
+                        task_id: parent.task_id,
+                        execution_id: Some(parent.execution_id),
+                        from: previous_revision.clone(),
+                        to: current_revision.clone(),
+                        added: paths.clone(),
+                        modified: Vec::new(),
+                        deleted: Vec::new(),
+                        source: crate::workspace::RevisionSource::Tool,
+                        isolated_workspace: None,
+                    });
+                let _ = self
+                    .session
+                    .append_shared_event(SessionEvent::IntegrationCompleted {
+                        parent_task_id: parent.task_id,
+                        parent_execution_id: parent.execution_id,
+                        child_execution_id: record.owner_execution_id,
+                        parent_revision: current_revision.clone(),
+                        changed_paths: paths,
+                    });
+                IntegrationResponse {
+                    ok: true,
+                    conflict: false,
+                    previous_revision: Some(previous_revision),
+                    parent_revision: Some(current_revision),
+                    child_base: None,
+                    parent_current: None,
+                    paths: changed_paths,
+                    error: None,
+                    requires_reverification: true,
+                }
+            }
+            Ok(IntegrationResult::Conflict {
+                child_base,
+                parent_current,
+                paths,
+            }) => {
+                let _ = self
+                    .session
+                    .append_shared_event(SessionEvent::IntegrationConflict {
+                        parent_task_id: parent.task_id,
+                        parent_execution_id: parent.execution_id,
+                        child_execution_id: record.owner_execution_id,
+                        child_base: child_base.clone(),
+                        parent_current: parent_current.clone(),
+                        paths: paths
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                    });
+                IntegrationResponse {
+                    ok: false,
+                    conflict: true,
+                    previous_revision: None,
+                    parent_revision: None,
+                    child_base: Some(child_base),
+                    parent_current: Some(parent_current),
+                    paths,
+                    error: None,
+                    requires_reverification: false,
+                }
+            }
+            Err(error) => IntegrationResponse::error(error.to_string()),
+        }
     }
 }
 

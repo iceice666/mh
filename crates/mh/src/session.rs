@@ -9,7 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::identity::{ExecutionId, RevisionId, TaskId};
+use crate::delegation::{DelegateResult, DelegationAccess};
+use crate::identity::{ExecutionId, IsolatedWorkspaceId, RevisionId, TaskId};
 use crate::ptc::{PtcEvent, PtcEventSink, PtcEventSinkError, PtcOutcome, PtcResult};
 use crate::tools::{ResultId, ResultStore, ToolEffects};
 use crate::workspace::{
@@ -171,6 +172,48 @@ pub enum SessionEvent {
         duration_ms: u64,
         end_revision: RevisionId,
     },
+    DelegationStarted {
+        parent_task_id: TaskId,
+        parent_execution_id: ExecutionId,
+        child_task_id: TaskId,
+        child_execution_id: ExecutionId,
+        access: DelegationAccess,
+        base_revision: RevisionId,
+    },
+    DelegationCompleted {
+        parent_task_id: TaskId,
+        parent_execution_id: ExecutionId,
+        result: DelegateResult,
+    },
+    DelegationCancelled {
+        parent_task_id: TaskId,
+        parent_execution_id: ExecutionId,
+        child_task_id: TaskId,
+        child_execution_id: ExecutionId,
+    },
+    IntegrationStarted {
+        parent_task_id: TaskId,
+        parent_execution_id: ExecutionId,
+        workspace: IsolatedWorkspaceId,
+        child_execution_id: ExecutionId,
+        child_base: RevisionId,
+        parent_base: RevisionId,
+    },
+    IntegrationCompleted {
+        parent_task_id: TaskId,
+        parent_execution_id: ExecutionId,
+        child_execution_id: ExecutionId,
+        parent_revision: RevisionId,
+        changed_paths: Vec<String>,
+    },
+    IntegrationConflict {
+        parent_task_id: TaskId,
+        parent_execution_id: ExecutionId,
+        child_execution_id: ExecutionId,
+        child_base: RevisionId,
+        parent_current: RevisionId,
+        paths: Vec<String>,
+    },
     HostCallStarted {
         task_id: TaskId,
         execution_id: ExecutionId,
@@ -200,6 +243,10 @@ pub enum SessionEvent {
         modified: Vec<String>,
         deleted: Vec<String>,
         source: RevisionSource,
+        /// Set when the revision belongs to an isolated child workspace rather
+        /// than the parent workspace, so parent state is never advanced to it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        isolated_workspace: Option<IsolatedWorkspaceId>,
     },
     WorkspaceDriftDetected {
         task_id: Option<TaskId>,
@@ -250,6 +297,16 @@ struct Journal {
     state: SessionState,
     events: Vec<EventRecord>,
 }
+impl Clone for Session {
+    fn clone(&self) -> Self {
+        Self {
+            root: self.root.clone(),
+            tracker: self.tracker.clone(),
+            journal: self.journal.clone(),
+        }
+    }
+}
+
 pub struct Session {
     root: PathBuf,
     tracker: Arc<dyn WorkspaceTracker>,
@@ -258,6 +315,7 @@ pub struct Session {
 #[derive(Debug, Clone)]
 pub struct SessionPtcEventSink {
     journal: Arc<Mutex<Journal>>,
+    isolated_workspace: Option<IsolatedWorkspaceId>,
 }
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -384,6 +442,43 @@ impl Session {
         })?;
         Ok(task_id)
     }
+    pub fn allocate_child_ids(&self) -> (TaskId, ExecutionId) {
+        (self.next_task_id(), self.next_execution_id())
+    }
+
+    pub fn append_shared_event(&self, event: SessionEvent) -> Result<EventRecord, SessionError> {
+        self.append_shared(event)
+    }
+
+    pub fn evidence_for_execution(&self, execution_id: ExecutionId) -> Vec<EvidenceRecord> {
+        self.events()
+            .into_iter()
+            .filter_map(|record| match record.event {
+                SessionEvent::EvidenceRecorded { evidence }
+                    if evidence.execution_id == execution_id =>
+                {
+                    Some(evidence)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn next_isolated_workspace_id(&self) -> IsolatedWorkspaceId {
+        let max_event_id = self
+            .events()
+            .into_iter()
+            .filter_map(|record| match record.event {
+                SessionEvent::IntegrationStarted { workspace, .. } => Some(workspace.0),
+                SessionEvent::DelegationCompleted { result, .. } => {
+                    result.workspace.map(|workspace| workspace.0)
+                }
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0);
+        IsolatedWorkspaceId(max_event_id.saturating_add(1))
+    }
     pub fn begin_execution(&mut self) -> Result<ExecutionId, SessionError> {
         if self.state().active_task.is_none() {
             Err(SessionError::State("session has no active task".into()))
@@ -447,6 +542,49 @@ impl Session {
         self.append(event)?;
         Ok(())
     }
+
+    pub fn append_child_ptc_result(&self, result: &PtcResult) -> Result<(), SessionError> {
+        let event = match &result.outcome {
+            PtcOutcome::Completed => SessionEvent::PtcCompleted {
+                task_id: result.task_id,
+                execution_id: result.execution_id,
+                value: result.value.clone(),
+                tool_calls: result.tool_calls,
+                duration_ms: result.duration_ms,
+                end_revision: result.end_revision.clone(),
+            },
+            PtcOutcome::Interrupted => SessionEvent::PtcFailed {
+                task_id: result.task_id,
+                execution_id: result.execution_id,
+                error: "cancelled".to_string(),
+                value: result.value.clone(),
+                tool_calls: result.tool_calls,
+                duration_ms: result.duration_ms,
+                end_revision: result.end_revision.clone(),
+            },
+            PtcOutcome::BudgetExceeded(kind) => SessionEvent::PtcFailed {
+                task_id: result.task_id,
+                execution_id: result.execution_id,
+                error: format!("budget exceeded: {kind}"),
+                value: result.value.clone(),
+                tool_calls: result.tool_calls,
+                duration_ms: result.duration_ms,
+                end_revision: result.end_revision.clone(),
+            },
+            PtcOutcome::Failed(error) => SessionEvent::PtcFailed {
+                task_id: result.task_id,
+                execution_id: result.execution_id,
+                error: error.clone(),
+                value: result.value.clone(),
+                tool_calls: result.tool_calls,
+                duration_ms: result.duration_ms,
+                end_revision: result.end_revision.clone(),
+            },
+        };
+        self.append_shared(event)?;
+        Ok(())
+    }
+
     pub fn reconcile_workspace(&self) -> Result<Option<WorkspaceDelta>, SessionError> {
         let expected = self.state().current_revision;
         let actual = self.tracker.current_revision()?.id;
@@ -482,6 +620,17 @@ impl Session {
     pub fn ptc_event_sink(&self) -> SessionPtcEventSink {
         SessionPtcEventSink {
             journal: self.journal.clone(),
+            isolated_workspace: None,
+        }
+    }
+
+    pub fn child_ptc_event_sink(
+        &self,
+        isolated_workspace: Option<IsolatedWorkspaceId>,
+    ) -> SessionPtcEventSink {
+        SessionPtcEventSink {
+            journal: self.journal.clone(),
+            isolated_workspace,
         }
     }
     pub fn root(&self) -> &Path {
@@ -500,12 +649,10 @@ impl Session {
         TaskId(
             self.events()
                 .iter()
-                .filter_map(|r| {
-                    if let SessionEvent::TaskStarted { task_id, .. } = r.event {
-                        Some(task_id.0)
-                    } else {
-                        None
-                    }
+                .filter_map(|r| match r.event {
+                    SessionEvent::TaskStarted { task_id, .. } => Some(task_id.0),
+                    SessionEvent::DelegationStarted { child_task_id, .. } => Some(child_task_id.0),
+                    _ => None,
                 })
                 .max()
                 .unwrap_or(0)
@@ -522,6 +669,11 @@ impl Session {
                     | SessionEvent::PtcFailed { execution_id, .. }
                     | SessionEvent::HostCallStarted { execution_id, .. }
                     | SessionEvent::ToolCompleted { execution_id, .. } => Some(execution_id.0),
+                    SessionEvent::DelegationStarted {
+                        child_execution_id,
+                        parent_execution_id,
+                        ..
+                    } => Some(child_execution_id.0.max(parent_execution_id.0)),
                     _ => None,
                 })
                 .max()
@@ -593,6 +745,7 @@ impl PtcEventSink for SessionPtcEventSink {
                 modified,
                 deleted,
                 source,
+                isolated_workspace: self.isolated_workspace,
             },
             PtcEvent::EvidenceRecorded { evidence } => SessionEvent::EvidenceRecorded { evidence },
         };
@@ -642,6 +795,7 @@ fn derive_work(state: SessionState, events: Vec<EventRecord>) -> WorkState {
                 added,
                 modified,
                 deleted,
+                isolated_workspace: None,
                 ..
             } if Some(task_id) == work.task_id => work.changed_paths.extend(
                 added
@@ -780,7 +934,11 @@ fn apply(state: &mut SessionState, record: &EventRecord) {
                 state.active_task = None;
             }
         }
-        SessionEvent::WorkspaceRevisionChanged { to, .. } => state.current_revision = to.clone(),
+        SessionEvent::WorkspaceRevisionChanged {
+            to,
+            isolated_workspace: None,
+            ..
+        } => state.current_revision = to.clone(),
         SessionEvent::WorkspaceDriftDetected { actual, .. } => {
             state.current_revision = actual.clone()
         }

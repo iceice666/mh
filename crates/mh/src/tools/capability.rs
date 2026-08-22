@@ -67,6 +67,8 @@ pub enum ProcessPolicy {
 pub struct Capabilities {
     /// Workspace root; all fs access is confined beneath it.
     pub workspace: PathBuf,
+    /// Whether filesystem mutation tools are available.
+    pub workspace_write: bool,
     /// Policy governing subprocess execution.
     pub process: ProcessPolicy,
 }
@@ -88,8 +90,20 @@ impl Capabilities {
         let workspace = workspace.into();
         Self {
             workspace: std::fs::canonicalize(&workspace).unwrap_or_else(|_| normalize(&workspace)),
+            workspace_write: true,
             process: ProcessPolicy::WorkspaceCwd,
         }
+    }
+
+    pub fn read_only(workspace: impl Into<PathBuf>) -> Self {
+        let mut capabilities = Self::new(workspace);
+        capabilities.workspace_write = false;
+        capabilities.process = ProcessPolicy::Disabled;
+        capabilities
+    }
+
+    pub const fn can_write_workspace(&self) -> bool {
+        self.workspace_write
     }
 
     /// Resolves an existing path for reading, following symlinks only when
