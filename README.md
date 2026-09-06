@@ -64,7 +64,8 @@ return tool("read", { path: "Cargo.toml" });
 ```
 
 Convenience globals are also available inside PTC: `read`, `write`, `edit`,
-`glob`, `grep`, `exec`, `batch`, `evidence`, `call_tool`, and `tools.*`. Here
+`glob`, `grep`, `exec`, `batch`, `evidence`, `checkpoint`, `restore`,
+`delegate`, `delegate_batch`, `integrate`, `call_tool`, and `tools.*`. Here
 `exec` starts an argv-based OS subprocess; it does not execute the PTC program
 itself. `batch(name, args)` runs bounded parallel `read`, `grep`, `glob`, or
 `exec` calls and preserves input ordering. `evidence(kind, ok, metadata)` records
@@ -76,3 +77,88 @@ match array; both arrays expose `.truncated`. Large subprocess output is stored
 as handle-backed results instead of entering model context directly. Handles
 provide `.read()`, `.head()`, `.tail()`, `.grep()`, `.json()`, plus `.id`,
 `.length`, `.totalBytes`, `.truncated`, and `.kind` metadata.
+
+## Delegation
+
+A PTC program can delegate a reasoning task to a bounded child agent. The child
+runs its own model loop with its own context; only a structured result crosses
+back into the parent. Child transcripts and child reasoning are never returned.
+
+```js
+var reports = delegate_batch([
+    { task: "Explain how the parser represents precedence.", access: "read" },
+    { task: "Identify the exact failing parser test behavior.", access: "read" }
+]);
+```
+
+`task` is the child objective and `access` is required. An optional `context`
+value is serialized into the child's compiled context, bounded to 8 KiB; the
+parent's own conversation is never copied in.
+
+`access` selects the child's capabilities:
+
+- `"read"` runs the child directly in the parent workspace with writes and
+  subprocesses disabled.
+- `"isolated-write"` materializes a private Git-backed workspace under
+  `.mh/workspaces/` at the parent's current revision. The child may write and
+  run processes there; the parent workspace is never mutated until integration.
+
+Every child is pinned to the parent's current tracked revision and refuses to
+start if its workspace does not materialize at exactly that revision.
+`"isolated-write"` additionally requires a Git-root workspace. Nested
+delegation is rejected: `delegate`, `delegate_batch`, and `integrate` are
+unavailable inside a child execution.
+
+`delegate(options)` returns, and `delegate_batch(options[])` returns one entry
+per input in input order:
+
+```js
+{
+    taskId, executionId,        // child identities, allocated from the session
+    ok,                         // true when the child produced a final answer
+    summary,                    // child answer, or the failure reason
+    baseRevision, finalRevision, changed,
+    workspace,                  // isolated workspace id; absent for "read"
+    evidence,                   // child evidence records, provenance preserved
+    findings                    // last child PTC value, or a truncation marker
+}
+```
+
+Delegation is bounded by `max_children` (8), `max_parallel_children` (4),
+`max_child_turns` (16), and `max_findings_bytes` (16 KiB). Exceeding a budget
+fails that child with `ok: false` instead of degrading the parent. Ctrl-C
+cancels running children and records `DelegationCancelled`.
+
+## Integration
+
+An isolated child's delta is applied only when the parent asks for it:
+
+```js
+var merged = integrate(child.workspace);
+
+if (merged.conflict) {
+    return merged;    // parent diverged on merged.paths; nothing was applied
+}
+```
+
+`integrate(workspace)` returns:
+
+```js
+{
+    ok, conflict,
+    previousRevision, parentRevision,   // present when applied
+    childBase, parentCurrent,           // present on conflict
+    paths,                              // applied paths, or conflicting paths
+    error,
+    requiresReverification              // true after a successful apply
+}
+```
+
+Integration is refused as a conflict when the parent mutated any path the child
+also changed; the parent workspace is left byte-identical in that case. A
+successful integration creates a new parent revision and sets
+`requiresReverification`, because evidence recorded before the merge no longer
+matches the current workspace epoch. Re-run verification and record fresh
+`evidence(...)` after integrating.
+
+`.mh/workspaces/` entries are garbage collected when the owning agent finishes.
