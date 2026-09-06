@@ -294,17 +294,26 @@ impl<M: Model + 'static> Agent<M> {
         let workspace = session.state().workspace.clone();
         let tracker_impl = WorkspaceTrackerImpl::open(&workspace)?;
         let tracker: Arc<dyn WorkspaceTracker> = Arc::new(tracker_impl);
-        let checkpoints = CheckpointStore::open(&workspace, tracker.clone())?;
         // Discovered once per session run: a prelude edited mid-run would
         // otherwise change the tool set the model was told about.
         let prelude =
             prelude::discover(&workspace, self.config.user_prelude.as_deref())?.map(Arc::new);
+        let prelude_id = prelude.as_deref().map(Prelude::identity);
         if let Some(prelude) = prelude.as_deref() {
+            // Durable provenance: the journal records which tool environment
+            // every later host call and evidence record was produced under.
+            session.append_shared_event(SessionEvent::PreludeLoaded {
+                path: prelude.path.clone(),
+                prelude: prelude.identity(),
+                described: prelude.description().is_some(),
+            })?;
             events(AgentEvent::PreludeLoaded {
                 path: prelude.path.clone(),
                 described: prelude.description().is_some(),
             });
         }
+        let checkpoints =
+            CheckpointStore::open(&workspace, tracker.clone())?.with_prelude(prelude_id.clone());
         let compiler = self.compiler_with_prelude(prelude.as_deref());
         let runtime = PtcRuntime::new(
             Capabilities::new(workspace),
@@ -679,7 +688,9 @@ impl<M: Model> AgentDelegationHost<M> {
             );
         }
         let checkpoints = match CheckpointStore::open(&workspace, tracker.clone()) {
-            Ok(checkpoints) => checkpoints,
+            Ok(checkpoints) => {
+                checkpoints.with_prelude(self.prelude.as_deref().map(Prelude::identity))
+            }
             Err(error) => {
                 return Self::failure(task_id, execution_id, revision.clone(), error.to_string());
             }

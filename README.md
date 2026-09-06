@@ -119,6 +119,29 @@ Delegated children evaluate the same prelude and receive the same documentation.
 A prelude that fails to parse surfaces on first use as a PTC failure naming the
 prelude path, not as an error inside the model's program.
 
+### Prelude provenance
+
+A prelude is execution configuration, not workspace content, so it is
+deliberately **not** part of the workspace revision. Including it would make
+the revision self-referential: the revision cache, session journal, and
+checkpoints all live under `.mh`, so hashing that directory would mean every
+recorded event changed the revision and no revision would ever converge.
+
+Its identity is tracked separately instead, which is what provenance actually
+needs:
+
+- Loading a prelude appends a durable `prelude_loaded` event carrying the
+  content hash, so the journal records which tool environment every later host
+  call ran under.
+- `evidence(...)` records the active prelude hash. Verification counts as fresh
+  only when both the revision and the prelude still match; evidence recorded
+  under a different prelude is reported as stale, because a changed prelude can
+  change what a verification actually ran.
+- `checkpoint()` records the active prelude. Restoring under a different
+  prelude is refused with a prelude-mismatch error rather than silently
+  reinstating content verified in another tool environment; the workspace is
+  left untouched when that happens.
+
 ## Delegation
 
 A PTC program can delegate a reasoning task to a bounded child agent. The child

@@ -8,12 +8,12 @@ use std::sync::atomic::AtomicBool;
 use parking_lot::Mutex;
 
 use mh::agent::{Agent, AgentConfig, AgentEvent};
-use mh::checkpoint::CheckpointStore;
+use mh::checkpoint::{CheckpointError, CheckpointStore};
 use mh::context::CompiledContext;
 use mh::identity::{ExecutionId, TaskId};
 use mh::model::{GenerationStop, Model, ModelError, ModelEvent, ModelOutput, ProgramLanguage};
-use mh::ptc::prelude::{self, WORKSPACE_PRELUDE};
-use mh::ptc::{PtcBudget, PtcExecution, PtcOutcome, PtcResult, PtcRuntime};
+use mh::ptc::prelude::{self, Prelude, WORKSPACE_PRELUDE};
+use mh::ptc::{PtcBudget, PtcEvent, PtcExecution, PtcOutcome, PtcResult, PtcRuntime};
 use mh::session::{Session, SessionEvent};
 use mh::tools::{Capabilities, ResultStore};
 use mh::workspace::{WorkspaceTracker, WorkspaceTrackerImpl};
@@ -95,9 +95,11 @@ fn repository() -> tempfile::TempDir {
 fn run_ptc(dir: &Path, source: &str) -> PtcResult {
     let tracker_impl = WorkspaceTrackerImpl::open(dir).unwrap();
     let tracker: Arc<dyn WorkspaceTracker> = Arc::new(tracker_impl);
-    let checkpoints = CheckpointStore::open(dir, tracker.clone()).unwrap();
     let start_revision = tracker.current_revision().unwrap().id;
     let found = prelude::discover(dir, None).unwrap().map(Arc::new);
+    let checkpoints = CheckpointStore::open(dir, tracker.clone())
+        .unwrap()
+        .with_prelude(found.as_deref().map(Prelude::identity));
     PtcRuntime::new(
         Capabilities::new(dir),
         ResultStore::new(),
@@ -367,4 +369,160 @@ fn a_prelude_cannot_shadow_a_host_global() {
         result.tool_calls, 1,
         "the call must reach the host, keeping the trace and revision honest"
     );
+}
+
+#[test]
+fn the_prelude_is_not_part_of_the_workspace_revision() {
+    let dir = repository();
+    let revision = |dir: &Path| {
+        WorkspaceTrackerImpl::open(dir)
+            .unwrap()
+            .current_revision()
+            .unwrap()
+            .id
+    };
+
+    let before = revision(dir.path());
+    write_prelude(dir.path(), "//! t() -> 1\nfunction t() { return 1; }");
+    let after_prelude = revision(dir.path());
+    assert_eq!(
+        before, after_prelude,
+        "a prelude is execution configuration, not workspace content; \
+         including it would make the revision self-referential because the \
+         revision cache also lives under .mh"
+    );
+
+    // Repeated reads must still converge, which is exactly what a
+    // self-referential revision would break.
+    assert_eq!(revision(dir.path()), after_prelude);
+    std::fs::write(dir.path().join("tracked"), "changed").unwrap();
+    assert_ne!(
+        revision(dir.path()),
+        after_prelude,
+        "real workspace content still moves the revision"
+    );
+}
+
+#[test]
+fn evidence_records_the_prelude_that_produced_it() {
+    let dir = repository();
+    write_prelude(
+        dir.path(),
+        "//! verify() -> records passing evidence\nfunction verify() { evidence(\"suite\", true); }",
+    );
+    let active = prelude::discover(dir.path(), None)
+        .unwrap()
+        .unwrap()
+        .identity();
+
+    let result = run_ptc(dir.path(), "verify(); return 1;");
+
+    assert_eq!(result.outcome, PtcOutcome::Completed);
+    let recorded = result
+        .events
+        .iter()
+        .find_map(|event| match event {
+            PtcEvent::EvidenceRecorded { evidence } => Some(evidence.clone()),
+            _ => None,
+        })
+        .expect("the prelude recorded evidence");
+    assert_eq!(
+        recorded.prelude,
+        Some(active),
+        "evidence must name the tool environment that produced it"
+    );
+}
+
+#[test]
+fn evidence_carries_no_prelude_when_none_is_active() {
+    let dir = repository();
+    let result = run_ptc(dir.path(), "evidence(\"suite\", true); return 1;");
+
+    assert_eq!(result.outcome, PtcOutcome::Completed);
+    let recorded = result
+        .events
+        .iter()
+        .find_map(|event| match event {
+            PtcEvent::EvidenceRecorded { evidence } => Some(evidence.clone()),
+            _ => None,
+        })
+        .expect("evidence was recorded");
+    assert_eq!(recorded.prelude, None);
+}
+
+#[test]
+fn restoring_a_checkpoint_across_a_prelude_change_is_refused() {
+    let dir = repository();
+    write_prelude(dir.path(), "function original() { return 1; }");
+    let tracker: Arc<dyn WorkspaceTracker> =
+        Arc::new(WorkspaceTrackerImpl::open(dir.path()).unwrap());
+    let identity = |dir: &Path| {
+        prelude::discover(dir, None)
+            .unwrap()
+            .map(|prelude| prelude.identity())
+    };
+
+    let store = CheckpointStore::open(dir.path(), tracker.clone())
+        .unwrap()
+        .with_prelude(identity(dir.path()));
+    let checkpoint = store.create(TaskId(1)).unwrap();
+    std::fs::write(dir.path().join("tracked"), "changed").unwrap();
+
+    // Same prelude: the checkpoint restores and the revision is recovered.
+    let restored = store.restore(TaskId(1), &checkpoint).unwrap();
+    assert_eq!(restored.id, checkpoint.revision);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("tracked")).unwrap(),
+        "base"
+    );
+
+    // Changed prelude: refused, and the workspace is left untouched.
+    write_prelude(dir.path(), "function replaced() { return 2; }");
+    std::fs::write(dir.path().join("tracked"), "changed again").unwrap();
+    let changed = CheckpointStore::open(dir.path(), tracker)
+        .unwrap()
+        .with_prelude(identity(dir.path()));
+    let error = changed
+        .restore(TaskId(1), &checkpoint)
+        .expect_err("restoring under a different prelude must be refused");
+    assert!(
+        matches!(error, CheckpointError::PreludeMismatch { .. }),
+        "expected a prelude mismatch, got: {error}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("tracked")).unwrap(),
+        "changed again",
+        "a refused restore must not mutate the workspace"
+    );
+}
+
+#[test]
+fn the_session_journal_records_the_active_prelude() {
+    let dir = repository();
+    write_prelude(dir.path(), "//! t() -> 1\nfunction t() { return 1; }");
+    let expected = prelude::discover(dir.path(), None)
+        .unwrap()
+        .unwrap()
+        .identity();
+    let model = ScriptedModel::new(vec![ModelOutput::Text("done".to_string())]);
+    Agent::new(model, AgentConfig::default())
+        .run_task(dir.path(), "inspect", &Arc::new(AtomicBool::new(false)))
+        .unwrap();
+
+    let logged = Session::resume(dir.path())
+        .unwrap()
+        .events()
+        .into_iter()
+        .find_map(|record| match record.event {
+            SessionEvent::PreludeLoaded {
+                prelude,
+                path,
+                described,
+            } => Some((prelude, path, described)),
+            _ => None,
+        })
+        .expect("the load is durable, not just a console line");
+    assert_eq!(logged.0, expected);
+    assert_eq!(logged.1, dir.path().join(WORKSPACE_PRELUDE));
+    assert!(logged.2);
 }

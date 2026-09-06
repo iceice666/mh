@@ -406,10 +406,15 @@ fn render_work_state(work: &WorkState) -> String {
         work.evidence
             .iter()
             .map(|record| {
-                let freshness = if record.revision == work.current_revision {
+                // Evidence is only fresh when both the workspace content and
+                // the tool environment that produced it still match. A changed
+                // prelude can change what a verification actually ran.
+                let freshness = if record.revision != work.current_revision {
+                    "stale"
+                } else if record.prelude == work.prelude {
                     "fresh"
                 } else {
-                    "stale"
+                    "stale — recorded under a different prelude"
                 };
                 format!(
                     "- {}: {} @ {} — {freshness}{}",
@@ -531,6 +536,7 @@ mod v03_prompt_tests {
 mod tests {
     use super::*;
     use crate::identity::{ExecutionId, RevisionId, TaskId};
+    use crate::ptc::prelude::PreludeId;
     use crate::session::EvidenceRecord;
 
     #[test]
@@ -582,8 +588,9 @@ mod tests {
     }
 
     #[test]
-    fn work_state_labels_revision_freshness() {
+    fn work_state_labels_revision_and_prelude_freshness() {
         let current = RevisionId("current".to_string());
+        let active = PreludeId("sha256:active".to_string());
         let work = WorkState {
             task_id: Some(TaskId(7)),
             objective: Some("inspect".to_string()),
@@ -593,16 +600,18 @@ mod tests {
             changed_paths: vec![std::path::PathBuf::from("src/lib.rs")],
             latest_ptc: None,
             latest_failure: None,
+            prelude: Some(active.clone()),
             evidence: vec![
                 EvidenceRecord {
                     kind: "tests".to_string(),
                     ok: true,
-                    revision: current,
+                    revision: current.clone(),
                     result_ids: vec![],
                     note: None,
                     timestamp_ms: 1,
                     task_id: TaskId(7),
                     execution_id: ExecutionId(1),
+                    prelude: Some(active),
                 },
                 EvidenceRecord {
                     kind: "lint".to_string(),
@@ -613,6 +622,18 @@ mod tests {
                     timestamp_ms: 2,
                     task_id: TaskId(7),
                     execution_id: ExecutionId(2),
+                    prelude: None,
+                },
+                EvidenceRecord {
+                    kind: "bench".to_string(),
+                    ok: true,
+                    revision: current,
+                    result_ids: vec![],
+                    note: None,
+                    timestamp_ms: 3,
+                    task_id: TaskId(7),
+                    execution_id: ExecutionId(3),
+                    prelude: Some(PreludeId("sha256:old".to_string())),
                 },
             ],
             legacy_evidence: vec![],
@@ -622,6 +643,10 @@ mod tests {
         assert!(rendered.contains("current revision: current"));
         assert!(rendered.contains("tests: PASS @ current — fresh"));
         assert!(rendered.contains("lint: PASS @ base — stale"));
+        assert!(
+            rendered.contains("bench: PASS @ current — stale — recorded under a different prelude"),
+            "matching revision under a changed prelude is not fresh: {rendered}"
+        );
     }
 
     #[test]

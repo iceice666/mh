@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::identity::{CheckpointId, RevisionId, TaskId};
+use crate::ptc::prelude::PreludeId;
 use crate::workspace::{
     EntryKind, ManifestEntry, WorkspaceError, WorkspaceRevision, WorkspaceTracker, capture_entries,
 };
@@ -20,6 +21,11 @@ pub struct Checkpoint {
     pub id: CheckpointId,
     pub revision: RevisionId,
     pub backend: CheckpointBackend,
+    /// Tool environment active when the checkpoint was taken. A checkpoint
+    /// restores workspace content, not the prelude, so restoring under a
+    /// different prelude is reported rather than silently accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prelude: Option<PreludeId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -59,6 +65,10 @@ pub enum CheckpointError {
         expected: RevisionId,
         actual: RevisionId,
     },
+    PreludeMismatch {
+        expected: Option<PreludeId>,
+        actual: Option<PreludeId>,
+    },
 }
 
 impl fmt::Display for CheckpointError {
@@ -93,6 +103,20 @@ impl fmt::Display for CheckpointError {
                 "restored revision {} does not match checkpoint revision {}",
                 actual.0, expected.0
             ),
+            Self::PreludeMismatch { expected, actual } => {
+                let name = |id: &Option<PreludeId>| {
+                    id.as_ref()
+                        .map_or_else(|| "none".to_owned(), |id| id.0.clone())
+                };
+                write!(
+                    f,
+                    "checkpoint was taken with prelude {} but the active prelude is {}; \
+                     restoring would reinstate workspace content verified under a \
+                     different tool environment",
+                    name(expected),
+                    name(actual)
+                )
+            }
         }
     }
 }
@@ -122,6 +146,7 @@ struct StoreInner {
     root: PathBuf,
     tracker: Arc<dyn WorkspaceTracker>,
     byte_cap: u64,
+    prelude: Option<PreludeId>,
     lock: Mutex<()>,
 }
 
@@ -167,9 +192,19 @@ impl CheckpointStore {
                 root,
                 tracker,
                 byte_cap: DEFAULT_BYTE_CAP,
+                prelude: None,
                 lock: Mutex::new(()),
             }),
         })
+    }
+
+    /// Records the active tool environment on every checkpoint this store
+    /// creates, so a later restore can detect that the prelude changed.
+    pub fn with_prelude(mut self, prelude: Option<PreludeId>) -> Self {
+        Arc::get_mut(&mut self.inner)
+            .expect("checkpoint store is not shared before with_prelude")
+            .prelude = prelude;
+        self
     }
 
     pub fn create(&self, task_id: TaskId) -> Result<Checkpoint, CheckpointError> {
@@ -218,6 +253,7 @@ impl CheckpointStore {
             id,
             revision: revision.id,
             backend,
+            prelude: self.inner.prelude.clone(),
         };
         let metadata = StoredCheckpoint {
             checkpoint: checkpoint.clone(),
@@ -267,6 +303,12 @@ impl CheckpointStore {
             return Err(CheckpointError::InvalidCheckpoint {
                 path: metadata_path,
                 message: "checkpoint metadata does not match supplied handle".to_owned(),
+            });
+        }
+        if stored.checkpoint.prelude != self.inner.prelude {
+            return Err(CheckpointError::PreludeMismatch {
+                expected: stored.checkpoint.prelude,
+                actual: self.inner.prelude.clone(),
             });
         }
         if let Some(expected_head) = &stored.head {

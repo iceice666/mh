@@ -29,7 +29,7 @@ use crate::tools::store::ResultStore;
 use crate::tools::{ResultId, ToolEffects};
 use crate::workspace::{RevisionSource, WorkspaceTracker};
 
-use super::prelude::Prelude;
+use super::prelude::{Prelude, PreludeId};
 use super::wrapper::{JSValue, Vm, VmError};
 
 /// Execution budget (spec §14).
@@ -350,6 +350,7 @@ impl PtcRuntime {
             tracker: self.tracker.as_ref(),
             checkpoints: &self.checkpoints,
             delegation: self.delegation.as_deref(),
+            prelude_id: self.prelude.as_deref().map(Prelude::identity),
         });
         let dispatch_ptr = Box::into_raw(dispatch);
         unsafe { vm.install_opaque(dispatch_ptr.cast::<c_void>(), interrupt_handler) };
@@ -611,6 +612,7 @@ struct DispatchBox<'a> {
     tracker: &'a dyn WorkspaceTracker,
     checkpoints: &'a CheckpointStore,
     delegation: Option<&'a dyn DelegationHost>,
+    prelude_id: Option<PreludeId>,
 }
 
 fn instruction_budget_exceeded(p: *mut DispatchBox) -> bool {
@@ -1234,6 +1236,7 @@ fn evidence_record(d: &DispatchBox, kind: String, ok: bool, metadata: &Value) ->
             .unwrap_or(0),
         task_id: d.state.execution.task_id,
         execution_id: d.state.execution.execution_id,
+        prelude: d.prelude_id.clone(),
     }
 }
 

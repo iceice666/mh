@@ -12,6 +12,13 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Content identity of a prelude: the tool environment a PTC program ran in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PreludeId(pub String);
+
 /// Workspace-relative prelude path; takes precedence over the user prelude.
 pub const WORKSPACE_PRELUDE: &str = ".mh/prelude.js";
 
@@ -63,6 +70,21 @@ impl Prelude {
     /// than surfacing as a failure inside the model's own program.
     pub fn eval_name(&self) -> String {
         format!("prelude:{}", self.path.display())
+    }
+
+    /// Content identity of the active tool environment.
+    ///
+    /// This is deliberately *not* part of the workspace revision. A revision
+    /// hashes workspace content; a prelude is execution configuration that
+    /// decides how tools behave. Mixing them would make the revision
+    /// self-referential, because the revision cache itself lives under `.mh`.
+    /// Recording the identity separately still answers the question evidence
+    /// actually needs: which tool environment produced this verification.
+    pub fn identity(&self) -> PreludeId {
+        let mut hash = Sha256::new();
+        hash.update(b"mh-prelude-v1\0");
+        hash.update(self.source.as_bytes());
+        PreludeId(format!("sha256:{:x}", hash.finalize()))
     }
 
     /// Tool descriptions this prelude advertises to the model, taken from its

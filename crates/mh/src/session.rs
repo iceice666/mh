@@ -11,6 +11,7 @@ use serde_json::Value;
 
 use crate::delegation::{DelegateResult, DelegationAccess};
 use crate::identity::{ExecutionId, IsolatedWorkspaceId, RevisionId, TaskId};
+use crate::ptc::prelude::PreludeId;
 use crate::ptc::{PtcEvent, PtcEventSink, PtcEventSinkError, PtcOutcome, PtcResult};
 use crate::tools::{ResultId, ResultStore, ToolEffects};
 use crate::workspace::{
@@ -77,6 +78,10 @@ pub struct EvidenceRecord {
     pub timestamp_ms: u64,
     pub task_id: TaskId,
     pub execution_id: ExecutionId,
+    /// Tool environment that produced this verification. Absent when no
+    /// prelude was active, and for records written before preludes existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prelude: Option<PreludeId>,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PtcSummary {
@@ -112,12 +117,19 @@ pub struct WorkState {
     pub latest_ptc: Option<PtcSummary>,
     pub latest_failure: Option<PtcSummary>,
     pub evidence: Vec<EvidenceRecord>,
+    /// Tool environment currently active, if a prelude was loaded.
+    pub prelude: Option<PreludeId>,
     pub legacy_evidence: Vec<LegacyEvidenceRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
+    PreludeLoaded {
+        path: PathBuf,
+        prelude: PreludeId,
+        described: bool,
+    },
     TaskStarted {
         task_id: TaskId,
         objective: String,
@@ -770,9 +782,11 @@ fn derive_work(state: SessionState, events: Vec<EventRecord>) -> WorkState {
         latest_failure: None,
         evidence: vec![],
         legacy_evidence: vec![],
+        prelude: None,
     };
     for record in events {
         match record.event {
+            SessionEvent::PreludeLoaded { prelude, .. } => work.prelude = Some(prelude),
             SessionEvent::TaskStarted {
                 task_id,
                 objective,
