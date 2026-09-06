@@ -58,11 +58,28 @@ impl fmt::Display for PreludeError {
 
 impl std::error::Error for PreludeError {}
 
+/// Where a prelude came from. Only workspace preludes arrive with a
+/// repository, so only those need a trust decision; the user prelude is the
+/// operator's own configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreludeOrigin {
+    Workspace,
+    User,
+}
+
+impl PreludeOrigin {
+    /// Whether loading this prelude requires an explicit trust decision.
+    pub const fn requires_confirmation(self) -> bool {
+        matches!(self, Self::Workspace)
+    }
+}
+
 /// A discovered prelude: its source and where it came from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Prelude {
     pub path: PathBuf,
     pub source: String,
+    pub origin: PreludeOrigin,
 }
 
 impl Prelude {
@@ -119,11 +136,11 @@ impl Prelude {
 /// the operator intended would change which tools the model believes it has.
 pub fn discover(workspace: &Path, user: Option<&Path>) -> Result<Option<Prelude>, PreludeError> {
     let workspace_prelude = workspace.join(WORKSPACE_PRELUDE);
-    if let Some(prelude) = load(&workspace_prelude)? {
+    if let Some(prelude) = load(&workspace_prelude, PreludeOrigin::Workspace)? {
         return Ok(Some(prelude));
     }
     match user {
-        Some(path) => load(path),
+        Some(path) => load(path, PreludeOrigin::User),
         None => Ok(None),
     }
 }
@@ -138,7 +155,7 @@ pub fn user_prelude_path() -> Option<PathBuf> {
         .map(|home| Path::new(&home).join(".config/mh/prelude.js"))
 }
 
-fn load(path: &Path) -> Result<Option<Prelude>, PreludeError> {
+fn load(path: &Path, origin: PreludeOrigin) -> Result<Option<Prelude>, PreludeError> {
     let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -166,6 +183,7 @@ fn load(path: &Path) -> Result<Option<Prelude>, PreludeError> {
     Ok(Some(Prelude {
         path: path.to_path_buf(),
         source,
+        origin,
     }))
 }
 
@@ -233,6 +251,7 @@ mod tests {
                 "function cargoTest() { return exec({ command: [\"cargo\", \"test\"] }); }\n",
             )
             .to_string(),
+            origin: PreludeOrigin::Workspace,
         };
         assert_eq!(
             prelude.description().unwrap(),
@@ -245,12 +264,14 @@ mod tests {
         let prelude = Prelude {
             path: PathBuf::from("p.js"),
             source: "// just code\nfunction f() { return 1; }\n".to_string(),
+            origin: PreludeOrigin::Workspace,
         };
         assert_eq!(prelude.description(), None);
 
         let blank = Prelude {
             path: PathBuf::from("p.js"),
             source: "//!\n//!   \n".to_string(),
+            origin: PreludeOrigin::Workspace,
         };
         assert_eq!(blank.description(), None, "blank doc lines are not content");
     }

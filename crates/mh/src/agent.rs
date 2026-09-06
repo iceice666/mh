@@ -21,6 +21,7 @@ use crate::model::{
 };
 use crate::ptc::prelude::{self, Prelude, PreludeError};
 use crate::ptc::runtime::{PtcEvent, PtcEventSink, PtcExecution};
+use crate::ptc::trust::{Trust, TrustDecision, TrustError, TrustStore};
 use crate::ptc::{PtcBudget, PtcOutcome, PtcRuntime};
 use crate::session::{Session, SessionError, SessionEvent};
 use crate::tools::Capabilities;
@@ -28,7 +29,14 @@ use crate::workspace::{WorkspaceError, WorkspaceTracker, WorkspaceTrackerImpl};
 
 const REPEAT_WARNING: &str = "The previous action was repeated without changing the result. Choose a different approach instead of retrying the same PTC program.";
 
-#[derive(Debug, Clone)]
+/// Decides whether a never-before-seen workspace prelude may run.
+///
+/// The library never prompts: a front end supplies this, so a non-interactive
+/// run can refuse by default instead of blocking on a terminal that is not
+/// there.
+pub type PreludeConfirm = Arc<dyn Fn(&Prelude) -> TrustDecision + Send + Sync>;
+
+#[derive(Clone)]
 pub struct AgentConfig {
     pub max_turns: usize,
     pub context_tokens: usize,
@@ -36,6 +44,25 @@ pub struct AgentConfig {
     pub delegation_budget: DelegationBudget,
     /// Fallback prelude used when the workspace defines none.
     pub user_prelude: Option<PathBuf>,
+    /// Where prelude trust decisions are recorded. Outside every workspace, so
+    /// a repository cannot ship its own authorization.
+    pub trust_store: Option<TrustStore>,
+    /// Consulted once per unseen workspace prelude. Absent means refuse.
+    pub confirm_prelude: Option<PreludeConfirm>,
+}
+
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("max_turns", &self.max_turns)
+            .field("context_tokens", &self.context_tokens)
+            .field("ptc_budget", &self.ptc_budget)
+            .field("delegation_budget", &self.delegation_budget)
+            .field("user_prelude", &self.user_prelude)
+            .field("trust_store", &self.trust_store)
+            .field("confirm_prelude", &self.confirm_prelude.is_some())
+            .finish()
+    }
 }
 
 impl Default for AgentConfig {
@@ -46,6 +73,8 @@ impl Default for AgentConfig {
             ptc_budget: PtcBudget::default(),
             delegation_budget: DelegationBudget::default(),
             user_prelude: prelude::user_prelude_path(),
+            trust_store: TrustStore::user().ok(),
+            confirm_prelude: None,
         }
     }
 }
@@ -56,12 +85,44 @@ pub enum AgentControl {
     Interrupt,
 }
 
+/// Why a discovered prelude did not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreludeRejection {
+    /// The operator declined it at the confirmation prompt.
+    Declined,
+    /// Declined in an earlier run; the recorded decision still stands.
+    PreviouslyRejected,
+    /// Nothing could ask: no confirmation callback was supplied.
+    CannotConfirm,
+    /// No user config directory, so no tamper-proof place to record trust.
+    NoTrustStore,
+}
+
+impl PreludeRejection {
+    pub const fn explain(self) -> &'static str {
+        match self {
+            Self::Declined => "declined at the confirmation prompt",
+            Self::PreviouslyRejected => "previously declined for this exact content",
+            Self::CannotConfirm => {
+                "not confirmed: this run cannot prompt, so an unreviewed prelude is refused"
+            }
+            Self::NoTrustStore => {
+                "no user config directory, so a trust decision cannot be recorded"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
     Model(ModelEvent),
     PreludeLoaded {
         path: PathBuf,
         described: bool,
+    },
+    PreludeRejected {
+        path: PathBuf,
+        reason: PreludeRejection,
     },
     PtcStarted,
     PtcHostCallStarted {
@@ -102,6 +163,7 @@ pub enum AgentError {
     Model(ModelError),
     Context(ContextError),
     Prelude(PreludeError),
+    Trust(TrustError),
     Cancelled,
     TurnLimit(usize),
 }
@@ -115,6 +177,7 @@ impl std::fmt::Display for AgentError {
             Self::Model(error) => error.fmt(f),
             Self::Context(error) => error.fmt(f),
             Self::Prelude(error) => error.fmt(f),
+            Self::Trust(error) => error.fmt(f),
             Self::Cancelled => write!(f, "agent cancelled"),
             Self::TurnLimit(limit) => write!(f, "agent reached {limit} model turns"),
         }
@@ -158,6 +221,12 @@ impl From<PreludeError> for AgentError {
     }
 }
 
+impl From<TrustError> for AgentError {
+    fn from(value: TrustError) -> Self {
+        Self::Trust(value)
+    }
+}
+
 pub struct Agent<M> {
     model: Arc<M>,
     compiler: ContextCompiler,
@@ -183,6 +252,67 @@ impl<M: Model + 'static> Agent<M> {
         ContextCompiler {
             prelude_tools: prelude.and_then(Prelude::description),
             ..self.compiler.clone()
+        }
+    }
+
+    /// Applies the trust decision for a discovered prelude.
+    ///
+    /// A workspace prelude arrives with the repository and runs arbitrary code
+    /// with the caller's capabilities, so it runs only once confirmed. The
+    /// decision is keyed by content and recorded outside the workspace, so
+    /// editing the prelude asks again and the repository cannot authorize
+    /// itself. Refusal drops the prelude rather than failing the run: the
+    /// agent still works, just without the derived tools.
+    fn authorize_prelude(
+        &self,
+        discovered: Option<Prelude>,
+        events: &mut dyn FnMut(AgentEvent),
+    ) -> Result<Option<Prelude>, AgentError> {
+        let Some(prelude) = discovered else {
+            return Ok(None);
+        };
+        if !prelude.origin.requires_confirmation() {
+            return Ok(Some(prelude));
+        }
+        let Some(store) = self.config.trust_store.as_ref() else {
+            // No tamper-proof place to record a decision means no way to honor
+            // one; running the prelude anyway would make the prompt theatre.
+            events(AgentEvent::PreludeRejected {
+                path: prelude.path.clone(),
+                reason: PreludeRejection::NoTrustStore,
+            });
+            return Ok(None);
+        };
+        match store.status(&prelude)? {
+            Trust::Trusted => Ok(Some(prelude)),
+            Trust::Rejected => {
+                events(AgentEvent::PreludeRejected {
+                    path: prelude.path.clone(),
+                    reason: PreludeRejection::PreviouslyRejected,
+                });
+                Ok(None)
+            }
+            Trust::Unknown => {
+                let Some(confirm) = self.config.confirm_prelude.as_ref() else {
+                    events(AgentEvent::PreludeRejected {
+                        path: prelude.path.clone(),
+                        reason: PreludeRejection::CannotConfirm,
+                    });
+                    return Ok(None);
+                };
+                let decision = confirm(&prelude);
+                store.record(&prelude, decision)?;
+                match decision {
+                    TrustDecision::Trusted => Ok(Some(prelude)),
+                    TrustDecision::Rejected => {
+                        events(AgentEvent::PreludeRejected {
+                            path: prelude.path.clone(),
+                            reason: PreludeRejection::Declined,
+                        });
+                        Ok(None)
+                    }
+                }
+            }
         }
     }
 
@@ -296,8 +426,8 @@ impl<M: Model + 'static> Agent<M> {
         let tracker: Arc<dyn WorkspaceTracker> = Arc::new(tracker_impl);
         // Discovered once per session run: a prelude edited mid-run would
         // otherwise change the tool set the model was told about.
-        let prelude =
-            prelude::discover(&workspace, self.config.user_prelude.as_deref())?.map(Arc::new);
+        let discovered = prelude::discover(&workspace, self.config.user_prelude.as_deref())?;
+        let prelude = self.authorize_prelude(discovered, events)?.map(Arc::new);
         let prelude_id = prelude.as_deref().map(Prelude::identity);
         if let Some(prelude) = prelude.as_deref() {
             // Durable provenance: the journal records which tool environment

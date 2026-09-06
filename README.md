@@ -108,6 +108,37 @@ prelude body itself is never sent. A prelude with no `//!` lines still loads and
 still works for hand-written PTC programs, but the model is not told it exists
 and will not call it; the startup line says so.
 
+### First-load confirmation
+
+A workspace prelude arrives with the repository and runs arbitrary code with
+your own capabilities, so `mh` asks before running one for the first time:
+
+```text
+[prelude] /path/to/repo/.mh/prelude.js is not yet trusted.
+  It runs before every PTC program with your own capabilities: it can
+  read and write this workspace and start subprocesses.
+  2 lines, sha256:80ac441f…
+  Advertised tools:
+    summarize(path) -> file info
+  Trust this prelude? [y/N]
+```
+
+- The decision is recorded in `$XDG_CONFIG_HOME/mh/prelude-trust.json`
+  (falling back to `~/.config/mh/`) — never in the workspace, because a
+  workspace-local record would be shipped by the repository it authorizes.
+- Trust is keyed by prelude **content**, so editing a trusted prelude asks
+  again, and cloning the same content elsewhere stays trusted.
+- Declining is remembered too; later runs report
+  `previously declined for this exact content` instead of re-asking.
+- Declining does not fail the run. The agent proceeds without the derived
+  tools.
+- The prompt appears only when stdin and stderr are both terminals. A piped or
+  CI run refuses an unreviewed prelude rather than blocking on a prompt nobody
+  can answer, and never mistakes task input for an answer. An
+  already-trusted prelude loads normally in those runs.
+- The user prelude in your config directory is never gated; it is your own
+  configuration, not a repository payload.
+
 A prelude is not a plugin system. It defines no host primitive, and its
 functions are ordinary PTC code: every call inside one is a normal host call,
 counted against the same tool budget, confined to the same workspace sandbox,

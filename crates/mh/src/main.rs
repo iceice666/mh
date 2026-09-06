@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use mh::agent::{Agent, AgentConfig, AgentControl, AgentError, AgentEvent};
 use mh::model::{ModelEvent, OpenAiResponses};
+use mh::ptc::{Prelude, TrustDecision};
 use mh::session::{Session, SessionError, SessionEvent};
 
 fn main() -> ExitCode {
@@ -113,7 +114,62 @@ fn run() -> Result<(), CliError> {
 
 fn new_agent() -> Result<Agent<OpenAiResponses>, CliError> {
     let model = OpenAiResponses::from_env().map_err(|error| CliError::Model(error.to_string()))?;
-    Ok(Agent::new(model, AgentConfig::default()))
+    Ok(Agent::new(model, agent_config()))
+}
+
+/// Supplies the interactive prelude confirmation.
+///
+/// Only attached when both stdin and stderr are terminals. A piped or CI run
+/// therefore refuses an unreviewed workspace prelude rather than blocking on a
+/// prompt nobody can answer, and never consumes task input as an answer.
+fn agent_config() -> AgentConfig {
+    let mut config = AgentConfig::default();
+    if io::stdin().is_terminal() && io::stderr().is_terminal() {
+        config.confirm_prelude = Some(Arc::new(confirm_prelude));
+    }
+    config
+}
+
+fn confirm_prelude(prelude: &Prelude) -> TrustDecision {
+    let lines = prelude.source.lines().count();
+    eprintln!("\n[prelude] {} is not yet trusted.", prelude.path.display());
+    eprintln!(
+        "  It runs before every PTC program with your own capabilities: it can\n  \
+         read and write this workspace and start subprocesses."
+    );
+    eprintln!("  {} lines, {}", lines, prelude.identity().0);
+    match prelude.description() {
+        Some(tools) => {
+            eprintln!("  Advertised tools:");
+            for line in tools.lines() {
+                eprintln!("    {line}");
+            }
+        }
+        None => eprintln!("  It advertises no tools to the model."),
+    }
+    eprintln!("  Review it before trusting. The decision is remembered for this");
+    eprintln!("  exact content; editing the prelude asks again.");
+
+    // Read from the terminal directly: in the REPL a reader thread owns stdin,
+    // and this runs before that thread starts.
+    loop {
+        eprint!("  Trust this prelude? [y/N] ");
+        if io::stderr().flush().is_err() {
+            return TrustDecision::Rejected;
+        }
+        let mut answer = String::new();
+        match io::stdin().read_line(&mut answer) {
+            // EOF: no answer is not consent.
+            Ok(0) => return TrustDecision::Rejected,
+            Ok(_) => {}
+            Err(_) => return TrustDecision::Rejected,
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => return TrustDecision::Trusted,
+            "" | "n" | "no" => return TrustDecision::Rejected,
+            _ => eprintln!("  Answer y or n."),
+        }
+    }
 }
 
 fn repl(workspace: &Path, cancelled: &Arc<AtomicBool>) -> Result<(), CliError> {
@@ -315,6 +371,13 @@ fn print_event(event: AgentEvent) {
                 " (no //! tool descriptions; the model will not be told about it)"
             };
             eprintln!("[prelude] {}{note}", path.display());
+        }
+        AgentEvent::PreludeRejected { path, reason } => {
+            eprintln!(
+                "[prelude] not loaded: {} — {}",
+                path.display(),
+                reason.explain()
+            );
         }
         AgentEvent::Model(ModelEvent::RequestStarted { endpoint }) => {
             eprintln!("[request] POST {endpoint}");
