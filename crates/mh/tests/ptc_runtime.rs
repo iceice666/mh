@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 use mh::checkpoint::CheckpointStore;
-use mh::identity::{ExecutionId, TaskId};
+use mh::identity::{AgentId, ExecutionId, TaskId};
 use mh::ptc::{PtcBudget, PtcDiagnosticKind, PtcEvent, PtcExecution, PtcOutcome, PtcRuntime};
 use mh::tools::{Capabilities, ResultStore, ToolEffects};
 use mh::workspace::{WorkspaceTracker, WorkspaceTrackerImpl};
@@ -34,6 +34,7 @@ fn run(dir: &std::path::Path, program: &str) -> mh::ptc::PtcResult {
         Arc::new(AtomicBool::new(false)),
         PtcExecution {
             task_id: TaskId(1),
+            agent: AgentId::ROOT,
             execution_id: ExecutionId(1),
             start_revision,
         },
@@ -57,6 +58,7 @@ fn execute(
         cancelled,
         PtcExecution {
             task_id: TaskId(1),
+            agent: AgentId::ROOT,
             execution_id: ExecutionId(1),
             start_revision,
         },
@@ -90,6 +92,7 @@ fn read_only_capabilities_disable_mutation_process_and_restore() {
         Arc::new(AtomicBool::new(false)),
         PtcExecution {
             task_id: TaskId(2),
+            agent: AgentId::ROOT,
             execution_id: ExecutionId(2),
             start_revision,
         },
@@ -639,6 +642,7 @@ fn live_sink_receives_events_before_execute_returns() {
         Arc::new(AtomicBool::new(false)),
         PtcExecution {
             task_id: TaskId(4),
+            agent: AgentId::ROOT,
             execution_id: ExecutionId(9),
             start_revision,
         },

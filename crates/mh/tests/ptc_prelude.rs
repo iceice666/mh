@@ -10,7 +10,7 @@ use parking_lot::Mutex;
 use mh::agent::{Agent, AgentConfig, AgentEvent, PreludeRejection};
 use mh::checkpoint::{CheckpointError, CheckpointStore};
 use mh::context::CompiledContext;
-use mh::identity::{ExecutionId, TaskId};
+use mh::identity::{AgentId, ExecutionId, TaskId};
 use mh::model::{GenerationStop, Model, ModelError, ModelEvent, ModelOutput, ProgramLanguage};
 use mh::ptc::prelude::{self, Prelude, WORKSPACE_PRELUDE};
 use mh::ptc::trust::{TrustDecision, TrustStore};
@@ -133,6 +133,7 @@ fn run_ptc(dir: &Path, source: &str) -> PtcResult {
         Arc::new(AtomicBool::new(false)),
         PtcExecution {
             task_id: TaskId(1),
+            agent: AgentId::ROOT,
             execution_id: ExecutionId(1),
             start_revision,
         },
