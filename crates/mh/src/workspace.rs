@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -375,28 +375,32 @@ fn capture_manifest(workspace: &Path, backend: &Backend) -> Result<Manifest, Wor
         let Ok(metadata) = fs::symlink_metadata(&absolute) else {
             continue;
         };
+        // A path can disappear between the directory walk and this read: an
+        // inspector capturing a revision runs concurrently with the task that
+        // is rewriting the workspace. A vanished path is simply not part of
+        // this revision, so skip it rather than failing a read-only caller.
         let (kind, bytes) = if metadata.file_type().is_symlink() {
-            (
-                EntryKind::Symlink,
-                path_bytes(
-                    &fs::read_link(&absolute).map_err(|source| WorkspaceError::Io {
-                        path: absolute.clone(),
+            match fs::read_link(&absolute) {
+                Ok(target) => (EntryKind::Symlink, path_bytes(&target)),
+                Err(source) if is_vanished(&source) => continue,
+                Err(source) => {
+                    return Err(WorkspaceError::Io {
+                        path: absolute,
                         source,
-                    })?,
-                ),
-            )
+                    });
+                }
+            }
         } else if metadata.is_file() {
-            let mut file = fs::File::open(&absolute).map_err(|source| WorkspaceError::Io {
-                path: absolute.clone(),
-                source,
-            })?;
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)
-                .map_err(|source| WorkspaceError::Io {
-                    path: absolute.clone(),
-                    source,
-                })?;
-            (EntryKind::File, bytes)
+            match fs::read(&absolute) {
+                Ok(bytes) => (EntryKind::File, bytes),
+                Err(source) if is_vanished(&source) => continue,
+                Err(source) => {
+                    return Err(WorkspaceError::Io {
+                        path: absolute,
+                        source,
+                    });
+                }
+            }
         } else {
             continue;
         };
@@ -499,23 +503,31 @@ fn walk_paths(
         out: &mut BTreeSet<PathBuf>,
     ) -> Result<(), WorkspaceError> {
         let dir = root.join(relative);
-        let entries = fs::read_dir(&dir).map_err(|source| WorkspaceError::Io {
-            path: dir.clone(),
-            source,
-        })?;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            // The task under inspection may remove a directory between the
+            // parent listing and this descent.
+            Err(source) if is_vanished(&source) => return Ok(()),
+            Err(source) => return Err(WorkspaceError::Io { path: dir, source }),
+        };
         for item in entries {
-            let item = item.map_err(|source| WorkspaceError::Io {
-                path: dir.clone(),
-                source,
-            })?;
+            let item = match item {
+                Ok(item) => item,
+                Err(source) if is_vanished(&source) => continue,
+                Err(source) => {
+                    return Err(WorkspaceError::Io {
+                        path: dir.clone(),
+                        source,
+                    });
+                }
+            };
             let path = relative.join(item.file_name());
             if excluded_always(&path) || (fallback && excluded_fallback(&path)) {
                 continue;
             }
-            let ty = item.file_type().map_err(|source| WorkspaceError::Io {
-                path: item.path(),
-                source,
-            })?;
+            let Ok(ty) = item.file_type() else {
+                continue;
+            };
             if ty.is_dir() {
                 visit(root, &path, fallback, out)?;
             } else if ty.is_file() || ty.is_symlink() {
@@ -527,6 +539,18 @@ fn walk_paths(
     let mut out = BTreeSet::new();
     visit(workspace, Path::new(""), fallback_excludes, &mut out)?;
     Ok(out)
+}
+
+/// Whether an I/O error means the path is simply no longer there.
+///
+/// Revision capture races the task it observes by design: `mh inspect` and a
+/// running agent look at the same tree. A path that disappeared is not part of
+/// the revision, which is different from a workspace we cannot read.
+fn is_vanished(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
 }
 
 fn excluded_always(path: &Path) -> bool {
