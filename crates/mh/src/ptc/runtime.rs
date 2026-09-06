@@ -20,8 +20,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::checkpoint::{Checkpoint, CheckpointStore};
-use crate::delegation::{DelegationHost, DelegationOptions};
-use crate::identity::{ExecutionId, RevisionId, TaskId};
+use crate::delegation::{AgentSpawnOptions, DelegationHost, delegate_batch_sync, delegate_sync};
+use crate::goal::{FinishRequest, GoalUpdate};
+use crate::identity::{AgentId, ExecutionId, ProcessId, RevisionId, TaskId};
+use crate::process::{ProcessSpec, ProcessStream};
 use crate::session::EvidenceRecord;
 use crate::tools::capability::Capabilities;
 use crate::tools::fs_tools;
@@ -162,6 +164,10 @@ pub trait PtcEventSink: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PtcExecution {
     pub task_id: TaskId,
+    /// Which agent execution this program belongs to. The root agent is
+    /// [`AgentId::ROOT`]; a delegated worker's own id gates orchestration
+    /// primitives, which keeps delegation depth at one.
+    pub agent: AgentId,
     pub execution_id: ExecutionId,
     pub start_revision: RevisionId,
 }
@@ -261,6 +267,46 @@ impl Drop for GcRoot<'_> {
         }
     }
 }
+
+/// Every host primitive reachable from a PTC program, as both a bare global
+/// and a `tools.*` alias.
+///
+/// Orchestration primitives are installed unconditionally and refuse at call
+/// time when unavailable: a worker that cannot see `agent_spawn` at all would
+/// get an opaque `ReferenceError` instead of a reason.
+const HOST_GLOBALS: &[&str] = &[
+    "tool",
+    "call_tool",
+    "read",
+    "write",
+    "edit",
+    "glob",
+    "grep",
+    "exec",
+    "batch",
+    "evidence",
+    "checkpoint",
+    "restore",
+    "goal",
+    "finish",
+    "agent_spawn",
+    "agent_poll",
+    "agent_join",
+    "agent_cancel",
+    "agent_send",
+    "agent_list",
+    "delegate",
+    "delegate_batch",
+    "integrate",
+    "discard",
+    "process_spawn",
+    "process_poll",
+    "process_tail",
+    "process_wait",
+    "process_kill",
+    "process_write",
+    "process_list",
+];
 
 /// The PTC runtime. One instance per program execution.
 pub struct PtcRuntime {
@@ -476,46 +522,14 @@ impl PtcRuntime {
             f
         };
         let g = unsafe { mh_quickjs_sys::JS_GetGlobalObject(vm.ctx()) };
-        for name in [
-            "tool",
-            "call_tool",
-            "read",
-            "write",
-            "edit",
-            "glob",
-            "grep",
-            "exec",
-            "batch",
-            "delegate",
-            "delegate_batch",
-            "integrate",
-            "evidence",
-            "checkpoint",
-            "restore",
-        ] {
+        // One list: a global and its `tools.*` alias must never diverge, or a
+        // program would reach a primitive through one name and not the other.
+        let tools = unsafe { GcRoot::new(vm, v.object()) };
+        for name in HOST_GLOBALS {
             let f = unsafe { GcRoot::new(vm, make_fn(vm, name)) };
             v.set(g, name, f.get())?;
-        }
-        // tools.read(...) alias family (spec §18.1).
-        let tools = unsafe { GcRoot::new(vm, v.object()) };
-        for name in [
-            "read",
-            "write",
-            "edit",
-            "glob",
-            "grep",
-            "exec",
-            "call_tool",
-            "batch",
-            "delegate",
-            "delegate_batch",
-            "integrate",
-            "evidence",
-            "checkpoint",
-            "restore",
-        ] {
-            let f = unsafe { GcRoot::new(vm, make_fn(vm, name)) };
-            v.set(tools.get(), name, f.get())?;
+            let alias = unsafe { GcRoot::new(vm, make_fn(vm, name)) };
+            v.set(tools.get(), name, alias.get())?;
         }
         v.set(g, "tools", tools.get())?;
         Ok(())
@@ -791,50 +805,186 @@ unsafe fn run_host_call(
             }
             Ok(arr.pop())
         }
-        "delegate" => {
-            let host = d
-                .delegation
-                .ok_or("delegate: unavailable in child execution")?;
-            let options = arg(0).ok_or("delegate(options)")?;
-            let options: DelegationOptions =
+        "goal" => {
+            let host = orchestration_host(d, "goal")?;
+            let update = arg(0).ok_or("goal(update)")?;
+            let update: GoalUpdate =
+                serde_json::from_value(vm_to_json(vm, update, d.budget.max_output_bytes))
+                    .map_err(|error| format!("goal: invalid update: {error}"))?;
+            let goal = host
+                .goal_update(&d.state.execution, update)
+                .map_err(|error| host_error("goal", &error))?;
+            Ok(json_to_vm(vm, &goal))
+        }
+        "finish" => {
+            let host = orchestration_host(d, "finish")?;
+            let request: FinishRequest = match arg(0) {
+                Some(request) => {
+                    serde_json::from_value(vm_to_json(vm, request, d.budget.max_output_bytes))
+                        .map_err(|error| format!("finish: invalid request: {error}"))?
+                }
+                None => FinishRequest::default(),
+            };
+            // A refused finish is a value the model can branch on, not an
+            // exception: it must be able to fix the objection and retry.
+            let verdict = host
+                .finish(&d.state.execution, request)
+                .map_err(|error| host_error("finish", &error))?;
+            let mut value = serde_json::to_value(&verdict).unwrap_or(Value::Null);
+            if let Some(object) = value.as_object_mut() {
+                object.insert("explanation".to_string(), json!(verdict.explain()));
+            }
+            Ok(json_to_vm(vm, &value))
+        }
+        "agent_spawn" => {
+            let host = orchestration_host(d, "agent_spawn")?;
+            let options = arg(0).ok_or("agent_spawn(options)")?;
+            let options: AgentSpawnOptions =
                 serde_json::from_value(vm_to_json(vm, options, d.budget.max_output_bytes))
-                    .map_err(|error| format!("delegate: invalid options: {error}"))?;
-            let revision = d
-                .state
-                .current_revision
-                .lock()
-                .expect("revision poisoned")
-                .clone();
+                    .map_err(|error| format!("agent_spawn: invalid options: {error}"))?;
+            let revision = current_revision(d);
+            let status = host
+                .agent_spawn(&d.state.execution, &revision, options)
+                .map_err(|error| host_error("agent_spawn", &error))?;
+            Ok(json_to_vm(vm, &serde_json::to_value(status).unwrap()))
+        }
+        "agent_poll" | "agent_cancel" => {
+            let host = orchestration_host(d, name)?;
+            let agent = agent_argument(vm, d, arg(0), name)?;
+            let status = if name == "agent_poll" {
+                host.agent_poll(agent)
+            } else {
+                host.agent_cancel(agent)
+            }
+            .map_err(|error| host_error(name, &error))?;
+            Ok(json_to_vm(vm, &serde_json::to_value(status).unwrap()))
+        }
+        "agent_join" => {
+            let host = orchestration_host(d, "agent_join")?;
+            let agent = agent_argument(vm, d, arg(0), "agent_join")?;
+            let result = host
+                .agent_join(agent)
+                .map_err(|error| host_error("agent_join", &error))?;
+            Ok(json_to_vm(vm, &serde_json::to_value(result).unwrap()))
+        }
+        "agent_send" => {
+            let host = orchestration_host(d, "agent_send")?;
+            let agent = agent_argument(vm, d, arg(0), "agent_send")?;
+            let message = arg(1)
+                .and_then(|a| v.to_string(a).ok())
+                .ok_or("agent_send(agent, message)")?;
+            let status = host
+                .agent_send(agent, message)
+                .map_err(|error| host_error("agent_send", &error))?;
+            Ok(json_to_vm(vm, &serde_json::to_value(status).unwrap()))
+        }
+        "agent_list" => {
+            let host = orchestration_host(d, "agent_list")?;
             Ok(json_to_vm(
                 vm,
-                &serde_json::to_value(host.delegate(&d.state.execution, &revision, options))
-                    .unwrap(),
+                &serde_json::to_value(host.agent_list()).unwrap(),
             ))
         }
+        "delegate" => {
+            let host = orchestration_host(d, "delegate")?;
+            let options = arg(0).ok_or("delegate(options)")?;
+            let options: AgentSpawnOptions =
+                serde_json::from_value(vm_to_json(vm, options, d.budget.max_output_bytes))
+                    .map_err(|error| format!("delegate: invalid options: {error}"))?;
+            let revision = current_revision(d);
+            let result = delegate_sync(host, &d.state.execution, &revision, options)
+                .map_err(|error| host_error("delegate", &error))?;
+            Ok(json_to_vm(vm, &serde_json::to_value(result).unwrap()))
+        }
         "delegate_batch" => {
-            let host = d
-                .delegation
-                .ok_or("delegate_batch: unavailable in child execution")?;
+            let host = orchestration_host(d, "delegate_batch")?;
             let options = arg(0).ok_or("delegate_batch(options[])")?;
-            let options: Vec<DelegationOptions> =
+            let options: Vec<AgentSpawnOptions> =
                 serde_json::from_value(vm_to_json(vm, options, d.budget.max_output_bytes))
                     .map_err(|error| format!("delegate_batch: invalid options: {error}"))?;
-            let revision = d
-                .state
-                .current_revision
-                .lock()
-                .expect("revision poisoned")
-                .clone();
+            let revision = current_revision(d);
+            let results = delegate_batch_sync(host, &d.state.execution, &revision, options);
+            Ok(json_to_vm(vm, &serde_json::to_value(results).unwrap()))
+        }
+        "process_spawn" => {
+            let host = orchestration_host(d, "process_spawn")?;
+            let spec = arg(0).ok_or("process_spawn(spec)")?;
+            let spec: ProcessSpec =
+                serde_json::from_value(vm_to_json(vm, spec, d.budget.max_output_bytes))
+                    .map_err(|error| format!("process_spawn: invalid spec: {error}"))?;
+            // Counted against the same process budget as exec: a long-lived
+            // process is still a process.
+            if d.state.process_calls.fetch_add(1, Ordering::Relaxed) + 1 > d.state.max_processes {
+                return Err("process budget exceeded".to_string());
+            }
+            let snapshot = host
+                .process_spawn(&d.state.execution, spec)
+                .map_err(|error| host_error("process_spawn", &error))?;
+            Ok(json_to_vm(vm, &serde_json::to_value(snapshot).unwrap()))
+        }
+        "process_poll" | "process_kill" => {
+            let host = orchestration_host(d, name)?;
+            let process = process_argument(vm, d, arg(0), name)?;
+            let snapshot = if name == "process_poll" {
+                host.process_poll(process)
+            } else {
+                host.process_kill(process)
+            }
+            .map_err(|error| host_error(name, &error))?;
+            Ok(json_to_vm(vm, &serde_json::to_value(snapshot).unwrap()))
+        }
+        "process_wait" => {
+            let host = orchestration_host(d, "process_wait")?;
+            let process = process_argument(vm, d, arg(0), "process_wait")?;
+            let timeout_ms = arg(1)
+                .and_then(|a| v.to_i64(a).ok())
+                .and_then(|ms| u64::try_from(ms).ok());
+            let snapshot = host
+                .process_wait(process, timeout_ms)
+                .map_err(|error| host_error("process_wait", &error))?;
+            Ok(json_to_vm(vm, &serde_json::to_value(snapshot).unwrap()))
+        }
+        "process_tail" => {
+            let host = orchestration_host(d, "process_tail")?;
+            let process = process_argument(vm, d, arg(0), "process_tail")?;
+            let stream = match arg(1).and_then(|a| v.to_string(a).ok()).as_deref() {
+                None | Some("stdout") => ProcessStream::Stdout,
+                Some("stderr") => ProcessStream::Stderr,
+                Some(other) => {
+                    return Err(format!(
+                        "process_tail: stream must be \"stdout\" or \"stderr\", got {other:?}"
+                    ));
+                }
+            };
+            let lines = arg(2)
+                .and_then(|a| v.to_i64(a).ok())
+                .and_then(|lines| usize::try_from(lines).ok())
+                .unwrap_or(100);
+            let tail = host
+                .process_tail(process, stream, lines)
+                .map_err(|error| host_error("process_tail", &error))?;
+            Ok(json_to_vm(vm, &serde_json::to_value(tail).unwrap()))
+        }
+        "process_write" => {
+            let host = orchestration_host(d, "process_write")?;
+            let process = process_argument(vm, d, arg(0), "process_write")?;
+            let data = arg(1)
+                .and_then(|a| v.to_string(a).ok())
+                .ok_or("process_write(process, data)")?;
+            let out = host
+                .process_write(process, &data)
+                .map_err(|error| host_error("process_write", &error))?;
+            Ok(json_to_vm(vm, &out))
+        }
+        "process_list" => {
+            let host = orchestration_host(d, "process_list")?;
             Ok(json_to_vm(
                 vm,
-                &serde_json::to_value(host.delegate_batch(&d.state.execution, &revision, options))
-                    .unwrap(),
+                &serde_json::to_value(host.process_list()).unwrap(),
             ))
         }
         "integrate" => {
-            let host = d
-                .delegation
-                .ok_or("integrate: unavailable in child execution")?;
+            let host = orchestration_host(d, "integrate")?;
             let workspace = arg(0).ok_or("integrate(workspace)")?;
             let workspace = vm_to_json(vm, workspace, d.budget.max_output_bytes);
             let id = workspace
@@ -842,12 +992,7 @@ unsafe fn run_host_call(
                 .and_then(Value::as_u64)
                 .or_else(|| workspace.as_u64())
                 .ok_or("integrate: workspace id required")?;
-            let revision = d
-                .state
-                .current_revision
-                .lock()
-                .expect("revision poisoned")
-                .clone();
+            let revision = current_revision(d);
             let response = host.integrate(
                 &d.state.execution,
                 &revision,
@@ -858,6 +1003,27 @@ unsafe fn run_host_call(
                     parent_revision.clone();
             }
             Ok(json_to_vm(vm, &serde_json::to_value(response).unwrap()))
+        }
+        "discard" => {
+            let host = orchestration_host(d, "discard")?;
+            let workspace = arg(0).ok_or("discard(workspace, reason)")?;
+            let workspace = vm_to_json(vm, workspace, d.budget.max_output_bytes);
+            let id = workspace
+                .get("id")
+                .and_then(Value::as_u64)
+                .or_else(|| workspace.as_u64())
+                .ok_or("discard: workspace id required")?;
+            let reason = arg(1)
+                .and_then(|a| v.to_string(a).ok())
+                .unwrap_or_else(|| "no reason given".to_string());
+            let out = host
+                .discard(
+                    &d.state.execution,
+                    crate::identity::IsolatedWorkspaceId(id),
+                    reason,
+                )
+                .map_err(|error| host_error("discard", &error))?;
+            Ok(json_to_vm(vm, &out))
         }
         "evidence" => {
             let kind = arg(0)
@@ -924,6 +1090,71 @@ fn ensure_direct_host_call(output: &Value) -> Result<(), String> {
         return Err(error.to_string());
     }
     Ok(())
+}
+
+/// Resolves the orchestration host, naming the primitive that needs it.
+///
+/// A runtime built without a host (a bare `PtcRuntime`, as in the tool tests)
+/// still installs the globals, so the failure names the reason rather than
+/// surfacing as an undefined identifier.
+fn orchestration_host<'a>(
+    d: &'a DispatchBox,
+    name: &str,
+) -> Result<&'a dyn DelegationHost, String> {
+    d.delegation
+        .ok_or_else(|| format!("{name}: no agent runtime is attached to this execution"))
+}
+
+/// Prefixes a host error with the primitive's name, unless the host already
+/// named it. Without this the model reads `agent_spawn: agent_spawn: …`, which
+/// looks like two failures instead of one.
+fn host_error(name: &str, error: &str) -> String {
+    if error.starts_with(name) {
+        error.to_string()
+    } else {
+        format!("{name}: {error}")
+    }
+}
+
+fn current_revision(d: &DispatchBox) -> RevisionId {
+    d.state
+        .current_revision
+        .lock()
+        .expect("revision poisoned")
+        .clone()
+}
+
+/// Accepts either a bare id or a status/result object carrying `agent`, so a
+/// program can pass what `agent_spawn` returned straight back.
+fn agent_argument(
+    vm: &Vm,
+    d: &DispatchBox,
+    value: Option<JSValue>,
+    name: &str,
+) -> Result<AgentId, String> {
+    let value = value.ok_or_else(|| format!("{name}(agent)"))?;
+    let value = vm_to_json(vm, value, d.budget.max_output_bytes);
+    value
+        .as_u64()
+        .or_else(|| value.get("agent").and_then(Value::as_u64))
+        .map(AgentId)
+        .ok_or_else(|| format!("{name}: agent id required"))
+}
+
+fn process_argument(
+    vm: &Vm,
+    d: &DispatchBox,
+    value: Option<JSValue>,
+    name: &str,
+) -> Result<ProcessId, String> {
+    let value = value.ok_or_else(|| format!("{name}(process)"))?;
+    let value = vm_to_json(vm, value, d.budget.max_output_bytes);
+    value
+        .as_u64()
+        .or_else(|| value.get("id").and_then(Value::as_u64))
+        .or_else(|| value.get("process").and_then(Value::as_u64))
+        .map(ProcessId)
+        .ok_or_else(|| format!("{name}: process id required"))
 }
 
 fn handle_id(v: &super::wrapper::ValueCtx, receiver: JSValue) -> Result<u64, String> {
