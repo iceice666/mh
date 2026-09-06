@@ -1,16 +1,23 @@
+use std::fs;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use mh::agent::{Agent, AgentConfig, AgentControl, AgentError, AgentEvent};
+use mh::agent::{Agent, AgentConfig, AgentControl, AgentError, AgentEvent, TaskOutcome};
+use mh::identity::TaskId;
 use mh::model::{ModelEvent, OpenAiResponses};
 use mh::ptc::{Prelude, TrustDecision};
-use mh::session::{Session, SessionError, SessionEvent};
+use mh::runtime::{TaskReport, cancel_task, steer_task, task_reports};
+use mh::session::{Session, SessionError, SessionEvent, TaskView};
+
+/// Subcommand the detach path re-execs itself with. Deliberately undocumented:
+/// it is an implementation detail of `--detach`, not a user-facing verb.
+const DETACHED_RUNNER: &str = "__run-detached";
 
 fn main() -> ExitCode {
     match run() {
@@ -18,6 +25,9 @@ fn main() -> ExitCode {
         Err(CliError::Cancelled) => ExitCode::from(130),
         Err(error) => {
             eprintln!("mh: {error}");
+            if matches!(error, CliError::Usage(_)) {
+                eprintln!("mh: run `mh --help` for usage");
+            }
             ExitCode::FAILURE
         }
     }
@@ -29,6 +39,8 @@ enum CliError {
     Session(SessionError),
     Agent(AgentError),
     Model(String),
+    Usage(String),
+    NoTask(u64),
     Cancelled,
 }
 
@@ -39,6 +51,8 @@ impl std::fmt::Display for CliError {
             Self::Session(error) => error.fmt(f),
             Self::Agent(error) => error.fmt(f),
             Self::Model(error) => f.write_str(error),
+            Self::Usage(message) => f.write_str(message),
+            Self::NoTask(id) => write!(f, "no task {id} in this session"),
             Self::Cancelled => f.write_str("cancelled"),
         }
     }
@@ -69,47 +83,444 @@ impl From<AgentError> for CliError {
 fn run() -> Result<(), CliError> {
     let workspace = std::env::current_dir()?;
     let cancelled = install_ctrl_c()?;
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let rest = || args[1..].to_vec();
 
-    if args
-        .first()
-        .is_some_and(|arg| arg == "--help" || arg == "-h")
-    {
-        print_help();
-        return Ok(());
-    }
-    if args
-        .first()
-        .is_some_and(|arg| arg == "--version" || arg == "-V")
-    {
-        println!("mh {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-
-    let mut printer = EventPrinter {
-        reasoning_open: false,
-    };
     match args.first().map(String::as_str) {
-        Some("resume") if args.len() == 1 => {
-            let agent = new_agent()?;
-            let answer = agent.resume_with_events(&workspace, &cancelled, &mut |event| {
-                printer.print(event);
-            })?;
-            println!("{answer}");
+        None => repl(&workspace, &cancelled),
+        Some("--help" | "-h") => {
+            print_help();
+            Ok(())
         }
-        Some("sessions") if args.len() == 1 => print_session(&workspace)?,
-        Some(_) => {
-            let task = std::mem::take(&mut args).join(" ");
-            let agent = new_agent()?;
-            let answer =
-                agent.run_task_with_events(&workspace, &task, &cancelled, &mut |event| {
-                    printer.print(event)
-                })?;
-            println!("{answer}");
+        Some("--version" | "-V") => {
+            println!("mh {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
         }
-        None => repl(&workspace, &cancelled)?,
+        Some("run") => cmd_run(&workspace, rest(), &cancelled),
+        Some("resume") => cmd_resume(&workspace, rest(), &cancelled),
+        Some("attach") => cmd_attach(&workspace, rest(), &cancelled),
+        Some("tasks") if args.len() == 1 => cmd_tasks(&workspace),
+        Some("inspect") => cmd_inspect(&workspace, rest()),
+        Some("steer") => cmd_steer(&workspace, rest()),
+        Some("cancel") => cmd_cancel(&workspace, rest()),
+        Some("sessions") if args.len() == 1 => print_session(&workspace),
+        Some(DETACHED_RUNNER) => cmd_run_detached(&workspace, rest(), &cancelled),
+        // Anything else is the task itself: `mh "fix the tests"`.
+        Some(_) => run_foreground(&workspace, &args.join(" "), &cancelled),
+    }
+}
+
+/// `mh run <task> [--detach]` and the bare `mh "<task>"` form.
+fn cmd_run(
+    workspace: &Path,
+    args: Vec<String>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<(), CliError> {
+    let detach = args.iter().any(|arg| arg == "--detach");
+    let task = args
+        .iter()
+        .filter(|arg| *arg != "--detach")
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if task.trim().is_empty() {
+        return Err(CliError::Usage("run needs a task".to_string()));
+    }
+    if detach {
+        detach_task(workspace, &task)
+    } else {
+        run_foreground(workspace, &task, cancelled)
+    }
+}
+
+fn run_foreground(
+    workspace: &Path,
+    task: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<(), CliError> {
+    let agent = new_agent()?;
+    let mut printer = EventPrinter::new();
+    let outcome = agent.run_task_controlled(workspace, task, cancelled, None, &mut |event| {
+        printer.print(event);
+    })?;
+    report_outcome(&outcome);
+    Ok(())
+}
+
+/// Journals the task, then re-execs this binary to drive it in a child process.
+///
+/// The task id is allocated before the fork so the parent can report something
+/// the user can steer immediately, and so a child that dies before its first
+/// model call still leaves a durable, inspectable task behind.
+fn detach_task(workspace: &Path, task: &str) -> Result<(), CliError> {
+    let task_id = Agent::<OpenAiResponses>::start_detached_task(workspace, task)?;
+    let log_path = task_log_path(workspace, task_id);
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let log = fs::File::create(&log_path)?;
+    let errors = log.try_clone()?;
+    let exe = std::env::current_exe()?;
+    Command::new(exe)
+        .arg(DETACHED_RUNNER)
+        .arg(task_id.0.to_string())
+        .current_dir(workspace)
+        // No stdin: a detached run must never block on a prompt, and that is
+        // also what makes it refuse an unreviewed prelude instead of hanging.
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(errors))
+        .spawn()?;
+    // Deliberately not waited on: the point of --detach is to return now.
+    eprintln!("[detach] task {} started", task_id.0);
+    eprintln!("[detach] log {}", log_path.display());
+    eprintln!(
+        "[detach] steer with `mh steer {} \"...\"`, watch with `mh inspect {}`",
+        task_id.0, task_id.0
+    );
+    println!("{}", task_id.0);
+    Ok(())
+}
+
+fn cmd_run_detached(
+    workspace: &Path,
+    args: Vec<String>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<(), CliError> {
+    let [id] = args.as_slice() else {
+        return Err(CliError::Usage(format!(
+            "{DETACHED_RUNNER} needs one task id"
+        )));
+    };
+    let task_id = parse_task_id(id)?;
+    let agent = new_agent()?;
+    let mut printer = EventPrinter::new();
+    let outcome = agent.resume_task(workspace, Some(task_id), cancelled, None, &mut |event| {
+        printer.print(event);
+    })?;
+    report_outcome(&outcome);
+    Ok(())
+}
+
+fn cmd_resume(
+    workspace: &Path,
+    args: Vec<String>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<(), CliError> {
+    let task_id = match args.as_slice() {
+        [] => None,
+        [id] => Some(parse_task_id(id)?),
+        _ => {
+            return Err(CliError::Usage(
+                "resume takes at most one task id".to_string(),
+            ));
+        }
+    };
+    let agent = new_agent()?;
+    let mut printer = EventPrinter::new();
+    let outcome = agent.resume_task(workspace, task_id, cancelled, None, &mut |event| {
+        printer.print(event);
+    })?;
+    report_outcome(&outcome);
+    Ok(())
+}
+
+/// `mh attach <task-id>`: report the task's durable state, then drive it here.
+///
+/// There is no way to take over a loop already running in another process, so
+/// attach does the two honest things it can: it shows the durable state, and it
+/// continues an active task in this process. Which one happened is stated
+/// explicitly rather than left to be inferred from the output.
+fn cmd_attach(
+    workspace: &Path,
+    args: Vec<String>,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<(), CliError> {
+    let [id] = args.as_slice() else {
+        return Err(CliError::Usage("attach needs one task id".to_string()));
+    };
+    let task_id = parse_task_id(id)?;
+    // Read-only first: attaching must not disturb a task already running
+    // elsewhere, and the full view is what makes the state legible.
+    let session = Session::inspect(workspace)?;
+    if !session.tasks().iter().any(|view| view.task_id == task_id) {
+        return Err(CliError::NoTask(task_id.0));
+    }
+    let view = session.task_view(task_id);
+    let status = view.status();
+    print_task_view(&view);
+    drop(session);
+
+    if !status.is_active() {
+        eprintln!(
+            "[attach] task {} is {}; nothing left to drive.",
+            task_id.0,
+            status.label()
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "[attach] task {} is {}; driving it in this process.",
+        task_id.0,
+        status.label()
+    );
+    let agent = new_agent()?;
+    let mut printer = EventPrinter::new();
+    let outcome = agent.resume_task(workspace, Some(task_id), cancelled, None, &mut |event| {
+        printer.print(event);
+    })?;
+    report_outcome(&outcome);
+    Ok(())
+}
+
+fn cmd_tasks(workspace: &Path) -> Result<(), CliError> {
+    let reports = task_reports(workspace)?;
+    if reports.is_empty() {
+        println!("no tasks");
+        return Ok(());
+    }
+    println!("{:>4}  {:<14}  {:>6}  OBJECTIVE", "ID", "STATUS", "WINDOW");
+    for report in &reports {
+        print_task_report(report);
     }
     Ok(())
+}
+
+fn print_task_report(report: &TaskReport) {
+    println!(
+        "{:>4}  {:<14}  {:>6}  {}",
+        report.task_id.0,
+        report.status.label(),
+        report.window,
+        summarize(&report.objective, 64)
+    );
+    let workers = report
+        .workers
+        .iter()
+        .filter(|(_, state, _)| !state.is_terminal())
+        .count();
+    let processes = report
+        .processes
+        .iter()
+        .filter(|(_, state, _)| state == "running")
+        .count();
+    let mut notes = Vec::new();
+    if report.cancel_requested {
+        notes.push("cancel requested".to_string());
+    }
+    if !report.pending_steering.is_empty() {
+        notes.push(format!("{} steering queued", report.pending_steering.len()));
+    }
+    if workers > 0 {
+        notes.push(format!("{workers} live worker(s)"));
+    }
+    if processes > 0 {
+        notes.push(format!("{processes} running process(es)"));
+    }
+    if !report.pending.is_empty() {
+        notes.push(format!("{} pending", report.pending.len()));
+    }
+    if !report.blockers.is_empty() {
+        notes.push(format!("{} blocker(s)", report.blockers.len()));
+    }
+    if !notes.is_empty() {
+        println!("{:>4}  {}", "", notes.join(", "));
+    }
+}
+
+fn cmd_inspect(workspace: &Path, args: Vec<String>) -> Result<(), CliError> {
+    let [id] = args.as_slice() else {
+        return Err(CliError::Usage("inspect needs one task id".to_string()));
+    };
+    let task_id = parse_task_id(id)?;
+    // Read-only: inspecting a live task must not append drift to its journal.
+    let session = Session::inspect(workspace)?;
+    if !session.tasks().iter().any(|view| view.task_id == task_id) {
+        return Err(CliError::NoTask(task_id.0));
+    }
+    print_task_view(&session.task_view(task_id));
+    Ok(())
+}
+
+fn print_task_view(view: &TaskView) {
+    let goal = &view.goal;
+    println!("task {}", view.task_id.0);
+    println!("agent: {}", view.agent.0);
+    println!("status: {}", goal.status.label());
+    println!("objective: {}", goal.objective);
+    println!(
+        "window: {} ({} turn(s) so far)",
+        view.window, view.turns_in_window
+    );
+    println!("revision: {}", goal.current_revision.0);
+    println!(
+        "verified revision: {}",
+        goal.last_verified_revision
+            .as_ref()
+            .map_or("none", |revision| revision.0.as_str())
+    );
+    if view.cancel_requested {
+        println!("cancel: requested");
+    }
+    if let Some(checkpoint) = &view.checkpoint {
+        println!("checkpoint: carried over from window {}", checkpoint.window);
+    }
+    if let Some(message) = &view.latest_user_message {
+        println!("last message: {}", summarize(message, 200));
+    }
+
+    print_section("acceptance criteria", &goal.acceptance_criteria, |item| {
+        let mark = if item.met { "x" } else { " " };
+        match &item.evidence_kind {
+            Some(kind) => format!("[{mark}] {} (evidence: {kind})", item.description),
+            None => format!("[{mark}] {}", item.description),
+        }
+    });
+    print_section("completed", &goal.completed_work, |item| item.title.clone());
+    print_section("pending", &goal.pending_work, |item| match &item.detail {
+        Some(detail) => format!("{} — {detail}", item.title),
+        None => item.title.clone(),
+    });
+    print_section("blockers", &goal.blockers, |item| match &item.needs {
+        Some(needs) => format!("{} (needs: {needs})", item.summary),
+        None => item.summary.clone(),
+    });
+    print_section("decisions", &goal.decisions, |item| match &item.rationale {
+        Some(rationale) => format!("{} — {rationale}", item.decision),
+        None => item.decision.clone(),
+    });
+    print_section("findings", &goal.findings, |item| {
+        if item.paths.is_empty() {
+            item.summary.clone()
+        } else {
+            let paths: Vec<String> = item
+                .paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect();
+            format!("{} [{}]", item.summary, paths.join(", "))
+        }
+    });
+    print_section("failed approaches", &goal.failed_approaches, |item| {
+        format!("{} — {}", item.approach, item.reason)
+    });
+    print_section("next actions", &goal.next_actions, Clone::clone);
+    print_section("changed paths", &view.changed_paths, |path| {
+        path.display().to_string()
+    });
+    print_section("pending steering", &view.pending_steering, |content| {
+        summarize(content, 120)
+    });
+
+    let evidence = view.latest_evidence();
+    print_section("verification", &evidence, |record| {
+        let status = if record.ok { "pass" } else { "fail" };
+        let freshness = if view.evidence_is_fresh(record) {
+            "fresh"
+        } else {
+            "stale"
+        };
+        match &record.note {
+            Some(note) => format!("{}: {status} ({freshness}) — {note}", record.kind),
+            None => format!("{}: {status} ({freshness})", record.kind),
+        }
+    });
+    print_section("workers", &view.agents, |record| {
+        format!(
+            "{} {} — {}",
+            record.agent.0,
+            record.state.label(),
+            summarize(&record.objective, 80)
+        )
+    });
+    print_section("processes", &view.processes, |record| {
+        let exit = record
+            .exit_code
+            .map_or_else(String::new, |code| format!(" exit {code}"));
+        format!(
+            "{} {}{exit} — {}",
+            record.process.0,
+            record.state,
+            record.argv.join(" ")
+        )
+    });
+}
+
+fn print_section<T>(title: &str, items: &[T], render: impl Fn(&T) -> String) {
+    if items.is_empty() {
+        return;
+    }
+    println!("{title}:");
+    for item in items {
+        println!("  {}", render(item));
+    }
+}
+
+fn cmd_steer(workspace: &Path, args: Vec<String>) -> Result<(), CliError> {
+    let (id, message) = match args.split_first() {
+        Some((id, rest)) if !rest.is_empty() => (id, rest.join(" ")),
+        _ => {
+            return Err(CliError::Usage(
+                "steer needs a task id and a message".to_string(),
+            ));
+        }
+    };
+    let task_id = steer_task(workspace, Some(parse_task_id(id)?), &message)?;
+    eprintln!("[steering] queued for task {}", task_id.0);
+    Ok(())
+}
+
+fn cmd_cancel(workspace: &Path, args: Vec<String>) -> Result<(), CliError> {
+    let task_id = match args.as_slice() {
+        [] => None,
+        [id] => Some(parse_task_id(id)?),
+        _ => {
+            return Err(CliError::Usage(
+                "cancel takes at most one task id".to_string(),
+            ));
+        }
+    };
+    let task_id = cancel_task(workspace, task_id)?;
+    eprintln!("[cancel] requested for task {}", task_id.0);
+    Ok(())
+}
+
+fn parse_task_id(raw: &str) -> Result<TaskId, CliError> {
+    raw.parse::<u64>()
+        .map(TaskId)
+        .map_err(|_| CliError::Usage(format!("`{raw}` is not a task id")))
+}
+
+fn task_log_path(workspace: &Path, task_id: TaskId) -> PathBuf {
+    workspace
+        .join(".mh")
+        .join("tasks")
+        .join(format!("{}.log", task_id.0))
+}
+
+/// Reports how a run ended. A parked task and a completed one are different
+/// facts — one needs the user, the other does not — so they never share wording.
+fn report_outcome(outcome: &TaskOutcome) {
+    if outcome.is_complete() {
+        eprintln!("[task] complete");
+    } else {
+        eprintln!("[task] parked — waiting for you; reply, or run `mh resume`");
+    }
+    println!("{}", outcome.message());
+}
+
+fn summarize(text: &str, max: usize) -> String {
+    let line = text.lines().next().unwrap_or_default().trim();
+    let truncated = text.lines().nth(1).is_some();
+    if line.chars().count() <= max {
+        return if truncated {
+            format!("{line} …")
+        } else {
+            line.to_string()
+        };
+    }
+    let head: String = line.chars().take(max).collect();
+    format!("{head} …")
 }
 
 fn new_agent() -> Result<Agent<OpenAiResponses>, CliError> {
@@ -178,9 +589,7 @@ fn repl(workspace: &Path, cancelled: &Arc<AtomicBool>) -> Result<(), CliError> {
     std::thread::spawn(move || read_stdin(input_tx));
     let (event_tx, event_rx) = mpsc::channel();
     let mut worker: Option<AgentWorker> = None;
-    let mut printer = EventPrinter {
-        reasoning_open: false,
-    };
+    let mut printer = EventPrinter::new();
     print_prompt()?;
 
     loop {
@@ -191,7 +600,7 @@ fn repl(workspace: &Path, cancelled: &Arc<AtomicBool>) -> Result<(), CliError> {
         {
             let finished = worker.take().expect("worker was present");
             match finished.handle.join() {
-                Ok(Ok(answer)) => println!("{answer}"),
+                Ok(Ok(outcome)) => report_outcome(&outcome),
                 Ok(Err(AgentError::Cancelled)) => eprintln!("[agent] cancelled"),
                 Ok(Err(error)) => eprintln!("[agent] {error}"),
                 Err(_) => eprintln!("[agent] worker panicked"),
@@ -216,7 +625,10 @@ fn repl(workspace: &Path, cancelled: &Arc<AtomicBool>) -> Result<(), CliError> {
                             let _ = active.handle.join();
                             return Ok(());
                         }
-                        "/help" => print_repl_help(),
+                        "/resume" => eprintln!("[agent] already running"),
+                        // Inspection and durable cancellation stay available
+                        // while the agent works; anything else is steering.
+                        _ if repl_shared_command(workspace, message)? => {}
                         _ => {
                             active
                                 .controls
@@ -233,25 +645,22 @@ fn repl(workspace: &Path, cancelled: &Arc<AtomicBool>) -> Result<(), CliError> {
 
                 match message {
                     "/quit" | "/exit" => return Ok(()),
-                    "/help" => print_repl_help(),
-                    "/session" => print_session(workspace)?,
                     "/resume" => {
                         worker = Some(spawn_agent_worker(
                             workspace.to_path_buf(),
                             None,
-                            true,
                             cancelled.clone(),
                             event_tx.clone(),
-                        )?)
+                        )?);
                     }
+                    _ if repl_shared_command(workspace, message)? => {}
                     _ => {
                         worker = Some(spawn_agent_worker(
                             workspace.to_path_buf(),
                             Some(message.to_string()),
-                            false,
                             cancelled.clone(),
                             event_tx.clone(),
-                        )?)
+                        )?);
                     }
                 }
                 print_prompt()?;
@@ -270,15 +679,61 @@ fn repl(workspace: &Path, cancelled: &Arc<AtomicBool>) -> Result<(), CliError> {
     }
 }
 
+/// Handles the REPL commands that mean the same thing whether or not an agent
+/// is running. Returns whether the line was one of them.
+fn repl_shared_command(workspace: &Path, message: &str) -> Result<bool, CliError> {
+    let mut words = message.split_whitespace();
+    let Some(command) = words.next() else {
+        return Ok(false);
+    };
+    let args: Vec<String> = words.map(str::to_string).collect();
+    match command {
+        "/help" => print_repl_help(),
+        "/session" => report(print_session(workspace)),
+        "/tasks" if args.is_empty() => report(cmd_tasks(workspace)),
+        "/inspect" => {
+            let args = match args.as_slice() {
+                [] => match repl_root_task(workspace)? {
+                    Some(task_id) => vec![task_id.0.to_string()],
+                    None => {
+                        eprintln!("[inspect] no task yet");
+                        return Ok(true);
+                    }
+                },
+                _ => args,
+            };
+            report(cmd_inspect(workspace, args));
+        }
+        "/cancel" => report(cmd_cancel(workspace, args)),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn repl_root_task(workspace: &Path) -> Result<Option<TaskId>, CliError> {
+    match Session::inspect(workspace) {
+        Ok(session) => Ok(session.root_task()),
+        Err(SessionError::NoSession(_)) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Reports a failed REPL command without ending the session: a typo or a
+/// missing session is not a reason to drop the user's context.
+fn report(result: Result<(), CliError>) {
+    if let Err(error) = result {
+        eprintln!("mh: {error}");
+    }
+}
+
 struct AgentWorker {
     controls: Sender<AgentControl>,
-    handle: JoinHandle<Result<String, AgentError>>,
+    handle: JoinHandle<Result<TaskOutcome, AgentError>>,
 }
 
 fn spawn_agent_worker(
     workspace: PathBuf,
     message: Option<String>,
-    resume: bool,
     cancelled: Arc<AtomicBool>,
     event_tx: Sender<AgentEvent>,
 ) -> Result<AgentWorker, CliError> {
@@ -289,16 +744,15 @@ fn spawn_agent_worker(
         let mut emit = |event| {
             let _ = event_tx.send(event);
         };
-        if resume {
-            agent.resume_controlled(&workspace, &cancelled, Some(&control_rx), &mut emit)
-        } else {
-            agent.send_message_controlled(
+        match message {
+            Some(message) => agent.send_message_controlled(
                 &workspace,
-                message.as_deref().expect("message task"),
+                &message,
                 &cancelled,
                 Some(&control_rx),
                 &mut emit,
-            )
+            ),
+            None => agent.resume_controlled(&workspace, &cancelled, Some(&control_rx), &mut emit),
         }
     });
     Ok(AgentWorker {
@@ -331,9 +785,15 @@ fn print_prompt() -> Result<(), io::Error> {
 }
 
 fn print_repl_help() {
-    println!("/resume  resume the workspace session");
-    println!("/session show session state");
-    println!("/quit    exit (interrupts an active agent)");
+    println!("/resume          resume the workspace session");
+    println!("/tasks           list durable tasks");
+    println!("/inspect [<id>]  full durable state of a task (default: this session's)");
+    println!("/cancel [<id>]   request durable cancellation");
+    println!("/session         show session state");
+    println!("/help            this list");
+    println!("/quit            exit (interrupts an active agent)");
+    println!();
+    println!("Any other line starts a task, or steers the one already running.");
 }
 
 struct EventPrinter {
@@ -341,6 +801,12 @@ struct EventPrinter {
 }
 
 impl EventPrinter {
+    const fn new() -> Self {
+        Self {
+            reasoning_open: false,
+        }
+    }
+
     fn print(&mut self, event: AgentEvent) {
         match event {
             AgentEvent::Model(ModelEvent::ReasoningSummaryDelta(delta)) => {
@@ -351,13 +817,20 @@ impl EventPrinter {
                 eprint!("{delta}");
                 let _ = io::stderr().flush();
             }
-            AgentEvent::Model(ModelEvent::ReasoningSummaryDone) => {
-                if self.reasoning_open {
-                    eprintln!();
-                    self.reasoning_open = false;
-                }
+            AgentEvent::Model(ModelEvent::ReasoningSummaryDone) => self.close_reasoning(),
+            event => {
+                // A streamed reasoning line has no newline yet; anything else
+                // printing over it would splice two messages together.
+                self.close_reasoning();
+                print_event(event);
             }
-            event => print_event(event),
+        }
+    }
+
+    fn close_reasoning(&mut self) {
+        if self.reasoning_open {
+            eprintln!();
+            self.reasoning_open = false;
         }
     }
 }
@@ -400,6 +873,43 @@ fn print_event(event: AgentEvent) {
                 eprintln!("[response] completed");
             }
         }
+        AgentEvent::ContextWindowStarted { window } => eprintln!("[window] {window}"),
+        AgentEvent::Compacted { window, tokens } => {
+            eprintln!("[compact] window {window} -> ~{tokens} tokens");
+        }
+        AgentEvent::AssistantMessage { content } => eprintln!("[assistant] {content}"),
+        AgentEvent::FinishProposed {
+            accepted,
+            objections,
+        } => {
+            if accepted {
+                eprintln!("[finish] accepted");
+            } else {
+                eprintln!("[finish] refused");
+                for objection in objections {
+                    eprintln!("  {objection}");
+                }
+            }
+        }
+        AgentEvent::TaskCompleted { summary } => eprintln!("[task] completed: {summary}"),
+        AgentEvent::GoalUpdated => eprintln!("[goal] updated"),
+        AgentEvent::AgentSpawned { agent, objective } => {
+            eprintln!("[worker {}] spawned: {objective}", agent.0);
+        }
+        AgentEvent::AgentSettled { agent, state } => {
+            eprintln!("[worker {}] {}", agent.0, state.label());
+        }
+        AgentEvent::ProcessSpawned { process, argv } => {
+            eprintln!("[process {}] {}", process.0, argv.join(" "));
+        }
+        AgentEvent::ProcessExited {
+            process,
+            exit_code: Some(code),
+        } => eprintln!("[process {}] exited {code}", process.0),
+        AgentEvent::ProcessExited {
+            process,
+            exit_code: None,
+        } => eprintln!("[process {}] exited without a status", process.0),
         AgentEvent::PtcStarted => eprintln!("[ptc] executing"),
         AgentEvent::PtcHostCallStarted { call_id, name } => {
             eprintln!("[ptc:{call_id}] {name}");
@@ -431,7 +941,7 @@ fn print_event(event: AgentEvent) {
 }
 
 fn print_session(workspace: &Path) -> Result<(), CliError> {
-    let session = Session::resume(workspace)?;
+    let session = Session::inspect(workspace)?;
     let state = session.state();
     println!("id: {}", state.id);
     println!(
@@ -442,6 +952,7 @@ fn print_session(workspace: &Path) -> Result<(), CliError> {
     );
     println!("current revision: {}", state.current_revision.0);
     println!("events: {}", session.events().len());
+    println!("tasks: {}", session.tasks().len());
     if let Some(answer) = session
         .events()
         .iter()
@@ -470,10 +981,21 @@ fn print_help() {
     println!("mh — minimal PTC coding agent");
     println!();
     println!("USAGE:");
-    println!("  mh                     open an interactive session");
-    println!("  mh \"fix the tests\"    start a task");
-    println!("  mh resume              resume the workspace session");
-    println!("  mh sessions            inspect the workspace session");
+    println!("  mh                              open an interactive session");
+    println!("  mh \"fix the tests\"              run a task in the foreground");
+    println!("  mh run <task> [--detach]        run a task; --detach returns immediately");
+    println!("  mh resume [<task-id>]           continue a durable task in the foreground");
+    println!("  mh attach <task-id>             show a task's state, then continue it here");
+    println!("  mh tasks                        list durable tasks");
+    println!("  mh inspect <task-id>            full durable state of one task");
+    println!("  mh steer <task-id> <message>    append durable steering");
+    println!("  mh cancel [<task-id>]           request durable cancellation");
+    println!("  mh sessions                     inspect the workspace session");
+    println!("  mh --help | --version");
+    println!();
+    println!("A detached run logs to .mh/tasks/<task-id>.log. Steering and cancellation go");
+    println!("through the session journal, so they reach a run in another process. `tasks`");
+    println!("and `inspect` are read-only and never disturb a running task.");
     println!();
     println!("ENVIRONMENT:");
     println!("  MH_API_KEY or OPENAI_API_KEY");
