@@ -1,7 +1,12 @@
 # mh
 
-Traceable, parallel, steerable PTC workflow runtime implemented in Rust with an
-embedded MicroQuickJS runtime.
+Durable agent runtime for long-running coding tasks, implemented in Rust with
+an embedded MicroQuickJS runtime.
+
+A task is durable. Model calls, context windows, PTC executions, delegated
+workers, and subprocesses are disposable execution mechanisms. A task survives
+many context windows, keeps working while its workers run, owns long-lived
+processes, and resumes after the process that started it exits.
 
 ## Build
 
@@ -34,20 +39,73 @@ Its `source` is executed inside bounded MicroQuickJS. Filesystem and process
 operations are synchronous host calls available only inside that PTC program;
 host-side `batch()` supplies bounded parallelism without Promise or async JavaScript.
 
+## Task lifecycle
+
+A task ends when the model explicitly calls `finish(...)` and the runtime
+accepts it. Plain text is a progress message: it is shown to you and parks the
+task as `waiting-user`, but it never completes it. This matters for long
+horizons, because a model reports progress constantly while the objective is
+still open.
+
+`finish()` is validated against durable state and refused — as a value the
+program can branch on, not an exception — while any of these hold:
+
+- a delegated worker is unresolved
+- a background process is still running
+- the newest verification of some kind failed
+- an isolated worker delta was never integrated or discarded
+- the workspace changed after the last passing verification
+- the model's own goal state still lists pending work or unmet criteria
+
+`finish({ force: true })` waives only the last item: judgement about remaining
+work. It never completes over a live worker, a running process, an unmerged
+delta, or a failed verification, because those would hide execution you can no
+longer see.
+
+Statuses are `queued`, `running`, `waiting-agent`, `waiting-process`,
+`waiting-user`, `blocked`, `verifying`, `completed`, `failed`, and `cancelled`.
+They are derived from the journal, not from whether a model call happens to be
+in flight, so an inspector and a restarted runtime always agree.
+
+## Context windows
+
+`max_turns_per_window` bounds one context window, not the task. When a window
+fills up, or the compiled context crosses the soft limit, the runtime writes a
+durable `ContextCheckpoint` — objective, decisions, completed and pending work,
+blockers, findings, failed approaches, changed paths, verification, workers,
+processes, next actions — and opens a fresh window from it. The old transcript
+is not replayed.
+
+Because the window is replaced while the task continues, the model records
+durable state as it goes with `goal(...)`. Anything not recorded is lost at the
+next rollover, so the prompt says exactly that.
+
 ## Use
 
 ```sh
-mh                         # interactive REPL
-mh "inspect and fix it"    # start a task in the current workspace
-mh resume                  # resume the durable workspace session
-mh sessions                # inspect session status and the last answer
+mh                            # interactive REPL
+mh "inspect and fix it"       # start a task in the current workspace
+mh run "..." --detach         # start a task that outlives this command
+mh tasks                      # list durable tasks
+mh inspect <task-id>          # full durable state of one task
+mh attach <task-id>           # show state, then continue it in the foreground
+mh resume [<task-id>]         # continue a durable task
+mh steer <task-id> "..."      # append durable steering
+mh cancel [<task-id>]         # request durable cancellation
+mh sessions                   # session status and the last answer
 ```
 
-Session state, compact host-call traces, working state, and verification evidence
-are stored under `.mh/` in the current workspace. Filesystem tools are confined
-to that workspace, including symlink-safe writes. Subprocesses start in the
-workspace with normal host OS capabilities; provider API keys are removed from
-their environment. Press Ctrl-C to cancel model, PTC, batch, or process work.
+`steer` and `cancel` are journal appends, so they work against a task running
+in another process: the running loop picks them up at its next safe point.
+`tasks` and `inspect` are read-only and never mutate the journal of a live
+task.
+
+Session state, compact host-call traces, goal state, worker and process
+lifecycles, and verification evidence are stored under `.mh/` in the current
+workspace. Filesystem tools are confined to that workspace, including
+symlink-safe writes. Subprocesses start in the workspace with normal host OS
+capabilities; provider API keys are removed from their environment. Press
+Ctrl-C to cancel model, PTC, batch, worker, or process work.
 
 ## PTC runtime
 
@@ -63,13 +121,21 @@ Inside MicroQuickJS, the canonical host ABI is synchronous JavaScript:
 return tool("read", { path: "Cargo.toml" });
 ```
 
-Convenience globals are also available inside PTC: `read`, `write`, `edit`,
-`glob`, `grep`, `exec`, `batch`, `evidence`, `checkpoint`, `restore`,
-`delegate`, `delegate_batch`, `integrate`, `call_tool`, and `tools.*`. Here
-`exec` starts an argv-based OS subprocess; it does not execute the PTC program
-itself. `batch(name, args)` runs bounded parallel `read`, `grep`, `glob`, or
-`exec` calls and preserves input ordering. `evidence(kind, ok, metadata)` records
-verification against the current workspace mutation epoch.
+Convenience globals are also available inside PTC, each with a `tools.*` alias:
+`read`, `write`, `edit`, `glob`, `grep`, `exec`, `batch`, `evidence`,
+`checkpoint`, `restore`, `goal`, `finish`, `agent_spawn`, `agent_poll`,
+`agent_join`, `agent_cancel`, `agent_send`, `agent_list`, `delegate`,
+`delegate_batch`, `integrate`, `discard`, `process_spawn`, `process_poll`,
+`process_tail`, `process_wait`, `process_kill`, `process_write`,
+`process_list`, and `call_tool`. Here `exec` starts an argv-based OS
+subprocess; it does not execute the PTC program itself. `batch(name, args)`
+runs bounded parallel `read`, `grep`, `glob`, or `exec` calls and preserves
+input ordering. `evidence(kind, ok, metadata)` records verification against the
+current workspace revision.
+
+MicroQuickJS stays synchronous. Concurrency lives in the host runtime, so
+nothing here needs a Promise: `agent_spawn` returns a handle immediately and
+the Rust scheduler runs the worker on its own thread.
 
 `read(path)` returns `{ path, content, totalLines, truncated }`; file text is in
 `.content`. `glob(pattern)` returns a string array and `grep(args)` returns a
@@ -173,60 +239,108 @@ needs:
   reinstating content verified in another tool environment; the workspace is
   left untouched when that happens.
 
-## Delegation
+## Workers
 
-A PTC program can delegate a reasoning task to a bounded child agent. The child
-runs its own model loop with its own context; only a structured result crosses
-back into the parent. Child transcripts and child reasoning are never returned.
+A PTC program delegates reasoning to a bounded worker agent. A worker is not a
+special mini-agent: it is a normal agent execution with a parent, so it gets
+its own durable task, journal, goal state, evidence, context rollover, resume,
+cancellation, and process ownership. Only a structured result crosses back;
+worker transcripts and worker reasoning are never returned.
+
+Workers are asynchronous. `agent_spawn` returns a handle immediately and the
+root agent keeps doing model and PTC work while they run:
 
 ```js
-var reports = delegate_batch([
-    { task: "Explain how the parser represents precedence.", access: "read" },
-    { task: "Identify the exact failing parser test behavior.", access: "read" }
-]);
+var a = agent_spawn({ task: "inspect the parser architecture", access: "read" });
+var b = agent_spawn({ task: "implement the storage refactor", profile: "implement" });
+
+// Root work happens here, while a and b run.
+
+agent_send(a.agent, "also inspect the parser tests");
+var status = agent_poll(a.agent);      // never blocks
+var result = agent_join(a.agent);      // blocks until this one worker settles
+agent_cancel(b.agent);                 // affects only b
 ```
 
-`task` is the child objective and `access` is required. An optional `context`
-value is serialized into the child's compiled context, bounded to 8 KiB; the
-parent's own conversation is never copied in.
+`delegate(options)` and `delegate_batch(options[])` remain, implemented as
+spawn-then-join over the same runtime; `delegate_batch` returns one entry per
+input in input order.
 
-`access` selects the child's capabilities:
+`task` is the worker objective. `access` is `"read"` or `"isolated-write"`, and
+may come from `profile` instead: `explore`, `implement`, `review`, or `test`,
+each supplying an access mode, a turn budget, and a system instruction. An
+explicit `access` overrides the profile default; an unknown profile name is an
+error rather than a silent fallback, because a worker running with unintended
+write access is not a detail. An optional `context` value is serialized into
+the worker's compiled context, bounded to 8 KiB; the parent's own conversation
+is never copied in.
 
-- `"read"` runs the child directly in the parent workspace with writes and
+`access` selects the worker's capabilities:
+
+- `"read"` runs the worker directly in the parent workspace with writes and
   subprocesses disabled.
 - `"isolated-write"` materializes a private Git-backed workspace under
-  `.mh/workspaces/` at the parent's current revision. The child may write and
+  `.mh/workspaces/` at the parent's current revision. The worker may write and
   run processes there; the parent workspace is never mutated until integration.
 
-Every child is pinned to the parent's current tracked revision and refuses to
+Every worker is pinned to the parent's current tracked revision and refuses to
 start if its workspace does not materialize at exactly that revision.
-`"isolated-write"` additionally requires a Git-root workspace. Nested
-delegation is rejected: `delegate`, `delegate_batch`, and `integrate` are
-unavailable inside a child execution.
+`"isolated-write"` additionally requires a Git-root workspace. Delegation depth
+is one: `agent_spawn`, `delegate`, `delegate_batch`, `integrate`, and `discard`
+refuse inside a worker, and the refusal names whichever primitive was called.
 
-`delegate(options)` returns, and `delegate_batch(options[])` returns one entry
-per input in input order:
+Worker states are `queued`, `running`, `waiting`, `completed`, `failed`, and
+`cancelled`. `agent_poll` returns the state plus the worker's own window, turn
+count, pending work, and next actions, so a parent can inspect progress without
+joining. `agent_join` returns:
 
 ```js
 {
-    taskId, executionId,        // child identities, allocated from the session
-    ok,                         // true when the child produced a final answer
-    summary,                    // child answer, or the failure reason
+    taskId, agent,              // worker identities, allocated from the session
+    ok,                         // true when the worker produced a final answer
+    summary,                    // worker answer, or the failure reason
     baseRevision, finalRevision, changed,
     workspace,                  // isolated workspace id; absent for "read"
-    evidence,                   // child evidence records, provenance preserved
-    findings                    // last child PTC value, or a truncation marker
+    evidence,                   // worker evidence records, provenance preserved
+    findings                    // last worker PTC value, or a truncation marker
 }
 ```
 
-Delegation is bounded by `max_children` (8), `max_parallel_children` (4),
-`max_child_turns` (16), and `max_findings_bytes` (16 KiB). Exceeding a budget
-fails that child with `ok: false` instead of degrading the parent. Ctrl-C
-cancels running children and records `DelegationCancelled`.
+Workers are bounded by `max_children` (8), `max_parallel_children` (4),
+`max_child_turns` (16, per window), `max_child_windows` (4), and
+`max_findings_bytes` (16 KiB). Exceeding a budget fails that worker with
+`ok: false` instead of degrading the parent. Ctrl-C cancels running workers.
+
+## Background processes
+
+`exec` is for foreground commands and waits for exit. A dev server, watcher,
+long build, or persistent test runner is a durable process resource instead:
+
+```js
+var p = process_spawn({ command: ["cargo", "watch", "-x", "test"] });
+
+process_poll(p.id);                      // {state, pid, exitCode, ...}
+process_tail(p.id, "stdout", 100);       // bounded tail, cheap while running
+process_wait(p.id, 5000);                // optional timeout
+process_write(p.id, "input\n");
+process_kill(p.id);
+process_list();
+```
+
+`process_spawn` returns immediately; output is captured incrementally to
+`.mh/processes/<id>.{out,err}` with a bounded in-memory tail, so tailing never
+loads an unbounded log. Process metadata is durable and visible through task
+inspection, and a running process blocks `finish()`.
+
+An OS process does not survive the runtime that started it. Rather than
+pretend otherwise, recovery marks a process from a previous runtime
+`orphaned`, records whether its recorded pid still appears to exist, and
+reports it that way. Metadata is durable; the process is not.
 
 ## Integration
 
-An isolated child's delta is applied only when the parent asks for it:
+An isolated worker's delta is applied only when the parent asks for it, and
+only once that worker has settled:
 
 ```js
 var merged = integrate(child.workspace);
@@ -249,11 +363,26 @@ if (merged.conflict) {
 }
 ```
 
-Integration is refused as a conflict when the parent mutated any path the child
-also changed; the parent workspace is left byte-identical in that case. A
-successful integration creates a new parent revision and sets
-`requiresReverification`, because evidence recorded before the merge no longer
-matches the current workspace epoch. Re-run verification and record fresh
-`evidence(...)` after integrating.
+Integration is refused as a conflict when the parent mutated any path the
+worker also changed; the parent workspace is left byte-identical in that case.
+Integrating a workspace whose worker is still running is refused outright,
+because merging a half-written tree is worse than waiting. A successful
+integration creates a new parent revision and sets `requiresReverification`,
+because evidence recorded before the merge no longer matches the current
+workspace revision. Re-run verification and record fresh `evidence(...)` after
+integrating.
 
-`.mh/workspaces/` entries are garbage collected when the owning agent finishes.
+A changed delta that is neither integrated nor discarded blocks `finish()`,
+since silently dropping a worker's work is exactly the failure the check
+exists to prevent. After a conflict the parent either resolves and re-runs the
+work, or abandons the delta explicitly:
+
+```js
+discard(child.workspace, "parent diverged on tracked; redoing it here");
+```
+
+`discard` is journaled as `IntegrationDiscarded`: losing work is recorded as a
+decision, not an omission.
+
+`.mh/workspaces/` entries are garbage collected when the owning agent
+finishes.
