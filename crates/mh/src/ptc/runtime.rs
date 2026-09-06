@@ -29,6 +29,7 @@ use crate::tools::store::ResultStore;
 use crate::tools::{ResultId, ToolEffects};
 use crate::workspace::{RevisionSource, WorkspaceTracker};
 
+use super::prelude::Prelude;
 use super::wrapper::{JSValue, Vm, VmError};
 
 /// Execution budget (spec §14).
@@ -269,6 +270,7 @@ pub struct PtcRuntime {
     tracker: Arc<dyn WorkspaceTracker>,
     checkpoints: CheckpointStore,
     delegation: Option<Arc<dyn DelegationHost>>,
+    prelude: Option<Arc<Prelude>>,
 }
 
 impl PtcRuntime {
@@ -286,6 +288,7 @@ impl PtcRuntime {
             tracker,
             checkpoints,
             delegation: None,
+            prelude: None,
         }
     }
 
@@ -293,6 +296,13 @@ impl PtcRuntime {
         self.delegation = Some(delegation);
         self
     }
+
+    /// Installs a prelude evaluated before every program in this runtime.
+    pub fn with_prelude(mut self, prelude: Option<Arc<Prelude>>) -> Self {
+        self.prelude = prelude;
+        self
+    }
+
     pub fn execute(
         &self,
         program: &str,
@@ -352,6 +362,32 @@ impl PtcRuntime {
                     PtcOutcome::Failed(message.clone()),
                     Some(diagnostic(PtcDiagnosticKind::Runtime, message)),
                 );
+            }
+            if let Some(prelude) = self.prelude.as_deref() {
+                if let Err(e) = vm.eval(&prelude.source, &prelude.eval_name()) {
+                    // A broken prelude is the operator's error, not the
+                    // model's. Failing here keeps it from surfacing as a
+                    // mysterious ReferenceError inside a correct program.
+                    let message = format!("{}: {e}", prelude.eval_name());
+                    return (
+                        Value::Null,
+                        PtcOutcome::Failed(message.clone()),
+                        Some(diagnostic(PtcDiagnosticKind::Runtime, message)),
+                    );
+                }
+                // Reassert the host ABI. A prelude runs with the globals
+                // installed so its top-level code may call them, but it must
+                // not replace one: a shadowed `read` or `exec` would execute
+                // while the host-call trace and revision tracking recorded
+                // nothing, silently breaking evidence provenance.
+                if let Err(e) = self.install_globals(&mut vm) {
+                    let message = e.to_string();
+                    return (
+                        Value::Null,
+                        PtcOutcome::Failed(message.clone()),
+                        Some(diagnostic(PtcDiagnosticKind::Runtime, message)),
+                    );
+                }
             }
             let wrapped = format!("(function() {{\n{program}\n}})()");
             let val = match vm.eval(&wrapped, "ptc.js") {

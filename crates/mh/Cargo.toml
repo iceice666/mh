@@ -19,6 +19,7 @@ sha2 = "0.10"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 
 [dev-dependencies]
+parking_lot = "0.12"
 tempfile = "3"
 
 [[bin]]

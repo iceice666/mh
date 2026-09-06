@@ -78,6 +78,47 @@ as handle-backed results instead of entering model context directly. Handles
 provide `.read()`, `.head()`, `.tail()`, `.grep()`, `.json()`, plus `.id`,
 `.length`, `.totalBytes`, `.truncated`, and `.kind` metadata.
 
+## Prelude
+
+Derived tools are defined at load time, not compiled in. `mh` evaluates a
+prelude before every PTC program, so adjusting the available tool set costs a
+file edit instead of a rebuild:
+
+```js
+// .mh/prelude.js
+//! summarize(path) -> { path, lines } for one workspace file
+//! cargoTest() -> exec result for the workspace test suite
+function summarize(path) {
+    var file = read(path);
+    return { path: file.path, lines: file.totalLines };
+}
+function cargoTest() {
+    return exec({ command: ["cargo", "test"] });
+}
+```
+
+The first prelude found is used: `.mh/prelude.js` in the workspace, otherwise
+`$XDG_CONFIG_HOME/mh/prelude.js` (falling back to `~/.config/mh/prelude.js`).
+A missing prelude is normal; an unreadable or oversized one (over 256 KiB)
+aborts the run rather than silently changing which tools exist. The active
+prelude is reported as `[prelude] <path>` at startup.
+
+`//!` lines are the tool documentation sent to the model, bounded to 4 KiB. The
+prelude body itself is never sent. A prelude with no `//!` lines still loads and
+still works for hand-written PTC programs, but the model is not told it exists
+and will not call it; the startup line says so.
+
+A prelude is not a plugin system. It defines no host primitive, and its
+functions are ordinary PTC code: every call inside one is a normal host call,
+counted against the same tool budget, confined to the same workspace sandbox,
+and recorded in the same host-call trace. A prelude cannot replace a host
+global — `read`, `exec`, and the rest are reasserted after it is evaluated, so
+redefining one has no effect and cannot desynchronize the trace from what ran.
+Delegated children evaluate the same prelude and receive the same documentation.
+
+A prelude that fails to parse surfaces on first use as a PTC failure naming the
+prelude path, not as an error inside the model's program.
+
 ## Delegation
 
 A PTC program can delegate a reasoning task to a bounded child agent. The child

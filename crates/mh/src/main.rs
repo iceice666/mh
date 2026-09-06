@@ -308,6 +308,14 @@ impl EventPrinter {
 
 fn print_event(event: AgentEvent) {
     match event {
+        AgentEvent::PreludeLoaded { path, described } => {
+            let note = if described {
+                ""
+            } else {
+                " (no //! tool descriptions; the model will not be told about it)"
+            };
+            eprintln!("[prelude] {}{note}", path.display());
+        }
         AgentEvent::Model(ModelEvent::RequestStarted { endpoint }) => {
             eprintln!("[request] POST {endpoint}");
         }

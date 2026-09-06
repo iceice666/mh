@@ -70,10 +70,16 @@ impl std::fmt::Display for ContextError {
 
 impl std::error::Error for ContextError {}
 
+/// Largest prelude description admitted into context. A prelude may be far
+/// larger than its documentation; only the documentation is ever sent.
+pub const MAX_PRELUDE_DESCRIPTION_BYTES: usize = 4 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ContextCompiler {
     pub max_tokens: usize,
     pub system_prompt: String,
+    /// Tool documentation advertised by the active PTC prelude, if any.
+    pub prelude_tools: Option<String>,
 }
 
 impl Default for ContextCompiler {
@@ -81,6 +87,7 @@ impl Default for ContextCompiler {
         Self {
             max_tokens: 32_000,
             system_prompt: canonical_system_prompt().to_string(),
+            prelude_tools: None,
         }
     }
 }
@@ -93,6 +100,9 @@ impl ContextCompiler {
             Priority::Hard,
             format!("[system]\n{}", self.system_prompt),
         )];
+        if let Some(tools) = self.prelude_item() {
+            candidates.push(tools);
+        }
         if let Some(objective) = work.objective.as_deref() {
             candidates.push(item(
                 ContextSource::Task,
@@ -165,6 +175,24 @@ impl ContextCompiler {
         self.select(candidates)
     }
 
+    /// Renders the prelude tool documentation as a hard context item. It is
+    /// hard priority because a model unaware of a prelude tool will re-derive
+    /// it by hand, which is exactly what defining the prelude avoided.
+    fn prelude_item(&self) -> Option<ContextItem> {
+        let tools = self.prelude_tools.as_deref()?.trim_end();
+        if tools.is_empty() {
+            return None;
+        }
+        Some(item(
+            ContextSource::System,
+            Priority::Hard,
+            format!(
+                "[workspace prelude tools]\nThese synchronous helpers are already defined for every PTC program in this workspace. Prefer them over reimplementing the same work inline.\n{}",
+                bounded_text(tools, MAX_PRELUDE_DESCRIPTION_BYTES)
+            ),
+        ))
+    }
+
     pub fn compile_child(
         &self,
         objective: &str,
@@ -172,7 +200,7 @@ impl ContextCompiler {
         workspace: &crate::workspace::WorkspaceRevision,
         access: crate::delegation::DelegationAccess,
     ) -> Result<CompiledContext, ContextError> {
-        self.select(vec![
+        let mut items = vec![
             item(
                 ContextSource::System,
                 Priority::Hard,
@@ -202,7 +230,13 @@ impl ContextCompiler {
                     workspace.id.0
                 ),
             ),
-        ])
+        ];
+        // Children run PTC against the same prelude, so they need the same
+        // tool documentation the parent gets.
+        if let Some(tools) = self.prelude_item() {
+            items.push(tools);
+        }
+        self.select(items)
     }
 
     pub fn compile_child_followup(
@@ -422,6 +456,17 @@ pub fn estimate_tokens(text: &str) -> usize {
         .max(1)
 }
 
+fn bounded_text(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let mut end = max_bytes.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n… <truncated>", &text[..end])
+}
+
 fn bounded_json(value: &serde_json::Value, max_bytes: usize) -> String {
     let text = serde_json::to_string_pretty(value).unwrap_or_else(|_| "null".to_string());
     if text.len() <= max_bytes {
@@ -493,6 +538,7 @@ mod tests {
         let compiler = ContextCompiler {
             max_tokens: 1,
             system_prompt: "system".to_string(),
+            prelude_tools: None,
         };
         let error = compiler
             .select(vec![item(
@@ -515,6 +561,7 @@ mod tests {
         let compiler = ContextCompiler {
             max_tokens: 5,
             system_prompt: String::new(),
+            prelude_tools: None,
         };
         let compiled = compiler
             .select(vec![

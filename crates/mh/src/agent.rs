@@ -2,7 +2,7 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -19,6 +19,7 @@ use crate::isolation::{IntegrationResult, IsolationStore};
 use crate::model::{
     GenerationStop, GenerationStopReason, Model, ModelError, ModelEvent, ModelOutput, lower,
 };
+use crate::ptc::prelude::{self, Prelude, PreludeError};
 use crate::ptc::runtime::{PtcEvent, PtcEventSink, PtcExecution};
 use crate::ptc::{PtcBudget, PtcOutcome, PtcRuntime};
 use crate::session::{Session, SessionError, SessionEvent};
@@ -33,6 +34,8 @@ pub struct AgentConfig {
     pub context_tokens: usize,
     pub ptc_budget: PtcBudget,
     pub delegation_budget: DelegationBudget,
+    /// Fallback prelude used when the workspace defines none.
+    pub user_prelude: Option<PathBuf>,
 }
 
 impl Default for AgentConfig {
@@ -42,6 +45,7 @@ impl Default for AgentConfig {
             context_tokens: 32_000,
             ptc_budget: PtcBudget::default(),
             delegation_budget: DelegationBudget::default(),
+            user_prelude: prelude::user_prelude_path(),
         }
     }
 }
@@ -55,6 +59,10 @@ pub enum AgentControl {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
     Model(ModelEvent),
+    PreludeLoaded {
+        path: PathBuf,
+        described: bool,
+    },
     PtcStarted,
     PtcHostCallStarted {
         call_id: u64,
@@ -93,6 +101,7 @@ pub enum AgentError {
     Checkpoint(CheckpointError),
     Model(ModelError),
     Context(ContextError),
+    Prelude(PreludeError),
     Cancelled,
     TurnLimit(usize),
 }
@@ -105,6 +114,7 @@ impl std::fmt::Display for AgentError {
             Self::Checkpoint(error) => error.fmt(f),
             Self::Model(error) => error.fmt(f),
             Self::Context(error) => error.fmt(f),
+            Self::Prelude(error) => error.fmt(f),
             Self::Cancelled => write!(f, "agent cancelled"),
             Self::TurnLimit(limit) => write!(f, "agent reached {limit} model turns"),
         }
@@ -142,6 +152,12 @@ impl From<ContextError> for AgentError {
     }
 }
 
+impl From<PreludeError> for AgentError {
+    fn from(value: PreludeError) -> Self {
+        Self::Prelude(value)
+    }
+}
+
 pub struct Agent<M> {
     model: Arc<M>,
     compiler: ContextCompiler,
@@ -158,6 +174,15 @@ impl<M: Model + 'static> Agent<M> {
             model: Arc::new(model),
             compiler,
             config,
+        }
+    }
+
+    /// Clones the compiler with the active prelude's tool documentation, so a
+    /// prelude the runtime will evaluate is also one the model knows about.
+    fn compiler_with_prelude(&self, prelude: Option<&Prelude>) -> ContextCompiler {
+        ContextCompiler {
+            prelude_tools: prelude.and_then(Prelude::description),
+            ..self.compiler.clone()
         }
     }
 
@@ -266,22 +291,36 @@ impl<M: Model + 'static> Agent<M> {
         controls: Option<&Receiver<AgentControl>>,
         events: &mut dyn FnMut(AgentEvent),
     ) -> Result<String, AgentError> {
-        let tracker_impl = WorkspaceTrackerImpl::open(&session.state().workspace)?;
+        let workspace = session.state().workspace.clone();
+        let tracker_impl = WorkspaceTrackerImpl::open(&workspace)?;
         let tracker: Arc<dyn WorkspaceTracker> = Arc::new(tracker_impl);
-        let checkpoints = CheckpointStore::open(&session.state().workspace, tracker.clone())?;
+        let checkpoints = CheckpointStore::open(&workspace, tracker.clone())?;
+        // Discovered once per session run: a prelude edited mid-run would
+        // otherwise change the tool set the model was told about.
+        let prelude =
+            prelude::discover(&workspace, self.config.user_prelude.as_deref())?.map(Arc::new);
+        if let Some(prelude) = prelude.as_deref() {
+            events(AgentEvent::PreludeLoaded {
+                path: prelude.path.clone(),
+                described: prelude.description().is_some(),
+            });
+        }
+        let compiler = self.compiler_with_prelude(prelude.as_deref());
         let runtime = PtcRuntime::new(
-            Capabilities::new(session.state().workspace.clone()),
+            Capabilities::new(workspace),
             session.result_store()?,
             self.config.ptc_budget.clone(),
             tracker,
             checkpoints,
         )
+        .with_prelude(prelude.clone())
         .with_delegation(Arc::new(AgentDelegationHost::new(
             self.model.clone(),
-            self.compiler.clone(),
+            compiler.clone(),
             self.config.clone(),
             session.clone(),
             cancelled.clone(),
+            prelude,
         )));
         let mut repeated = RepeatState::default();
 
@@ -296,7 +335,7 @@ impl<M: Model + 'static> Agent<M> {
             }
             check_cancelled(session, cancelled)?;
             session.reconcile_workspace()?;
-            let context = self.compiler.compile(session)?;
+            let context = compiler.compile(session)?;
             session.append(SessionEvent::ModelStarted { task_id })?;
             let (output, steering) =
                 self.generate_controlled(&context, cancelled, controls, events)?;
@@ -466,6 +505,7 @@ struct AgentDelegationHost<M> {
     config: AgentConfig,
     session: Session,
     cancelled: Arc<AtomicBool>,
+    prelude: Option<Arc<Prelude>>,
     isolation: Option<IsolationStore>,
     owner_task_id: std::sync::atomic::AtomicU64,
     children_started: std::sync::atomic::AtomicUsize,
@@ -494,6 +534,7 @@ impl<M: Model> AgentDelegationHost<M> {
         config: AgentConfig,
         session: Session,
         cancelled: Arc<AtomicBool>,
+        prelude: Option<Arc<Prelude>>,
     ) -> Self {
         let isolation = IsolationStore::open(session.workspace_root()).ok();
         let (next_task, next_execution) = session.allocate_child_ids();
@@ -504,6 +545,7 @@ impl<M: Model> AgentDelegationHost<M> {
             config,
             session,
             cancelled,
+            prelude,
             isolation,
             owner_task_id: std::sync::atomic::AtomicU64::new(0),
             children_started: std::sync::atomic::AtomicUsize::new(0),
@@ -662,7 +704,8 @@ impl<M: Model> AgentDelegationHost<M> {
             self.config.ptc_budget.clone(),
             tracker.clone(),
             checkpoints,
-        );
+        )
+        .with_prelude(self.prelude.clone());
         let sink: Arc<dyn PtcEventSink> = Arc::new(self.session.child_ptc_event_sink(workspace_id));
         let mut context = match self.compiler.compile_child(
             &options.task,
