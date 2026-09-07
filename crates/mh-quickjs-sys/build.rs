@@ -14,6 +14,26 @@ use std::process::Command;
 // C flags mirroring the upstream Makefile.
 const ENGINE_FLAGS: &[&str] = &["-D_GNU_SOURCE", "-fno-math-errno", "-fno-trapping-math"];
 
+/// Applies the upstream warning policy to a `cc` build.
+///
+/// Upstream builds `MicroQuickJS` with `-Wall` only; `cc` defaults to
+/// `-Wall -Wextra`, and `-Wextra` alone produces ~220 warnings in the
+/// vendored engine (`unused-parameter` on the uniform `JSCFunction`
+/// signature, `sign-compare`, `missing-field-initializers` from the
+/// `JS_PROP_END` sentinel). Keep `-Wall` so real diagnostics still
+/// surface, drop `-Wextra`.
+///
+/// `NIX_CC_WRAPPER_SUPPRESS_TARGET_WARNING` silences the nix
+/// cc-wrapper notice about `cc`'s `--target=<triple>`; the wrapper
+/// forces `-target arm64-apple-darwin` regardless, so codegen is
+/// unaffected.
+fn warning_policy(build: &mut cc::Build) -> &mut cc::Build {
+    build
+        .warnings(true)
+        .extra_warnings(false)
+        .env("NIX_CC_WRAPPER_SUPPRESS_TARGET_WARNING", "1")
+}
+
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -44,7 +64,7 @@ fn main() {
     );
 
     // 1. Host stdlib build tool.
-    cc::Build::new()
+    warning_policy(&mut cc::Build::new())
         .file(vendor.join("mquickjs_build.c"))
         .file(csrc.join("mh_stdlib.c"))
         .include(&vendor)
@@ -80,7 +100,7 @@ fn main() {
     std::fs::write(gendir.join("mh_stdlib.h"), &table.stdout).expect("write mh_stdlib.h");
 
     // 3. Compile the engine + shim.
-    cc::Build::new()
+    warning_policy(&mut cc::Build::new())
         .file(vendor.join("mquickjs.c"))
         .file(vendor.join("cutils.c"))
         .file(vendor.join("dtoa.c"))
