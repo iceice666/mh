@@ -16,6 +16,8 @@ use mh::ptc::{Prelude, TrustDecision};
 use mh::runtime::{TaskReport, cancel_task, steer_task, task_reports};
 use mh::session::{Session, SessionError, SessionEvent, TaskView, WorkspaceRunnerLock};
 
+mod tui;
+
 /// Subcommand the detach path re-execs itself with. Deliberately undocumented:
 /// it is an implementation detail of `--detach`, not a user-facing verb.
 const DETACHED_RUNNER: &str = "__run-detached";
@@ -88,6 +90,9 @@ fn run() -> Result<(), CliError> {
     let rest = || args[1..].to_vec();
 
     match args.first().map(String::as_str) {
+        // A conversational front end only makes sense on a real terminal: a
+        // pipe, a redirect, or a dumb terminal keeps the line-based REPL.
+        None if interactive_terminal() => tui::run(&workspace, cancelled.clone()),
         None => repl(&workspace, &cancelled),
         Some("--help" | "-h") => {
             print_help();
@@ -634,6 +639,18 @@ fn summarize(text: &str, max: usize) -> String {
     format!("{head} …")
 }
 
+/// Whether this process can own a full-screen UI.
+///
+/// All three streams must be terminals: the TUI reads keys from stdin and
+/// paints stdout, and a redirected stderr means diagnostics the user would
+/// never see. `TERM=dumb` promises no cursor addressing at all.
+fn interactive_terminal() -> bool {
+    io::stdin().is_terminal()
+        && io::stdout().is_terminal()
+        && io::stderr().is_terminal()
+        && std::env::var("TERM").is_ok_and(|term| term != "dumb")
+}
+
 fn new_agent() -> Result<Agent<OpenAiResponses>, CliError> {
     let model = OpenAiResponses::from_env().map_err(|error| CliError::Model(error.to_string()))?;
     Ok(Agent::new(model, agent_config()))
@@ -1092,7 +1109,7 @@ fn print_help() {
     println!("mh — durable PTC coding agent");
     println!();
     println!("USAGE:");
-    println!("  mh                              open an interactive session");
+    println!("  mh                              open the interactive UI (text REPL if not a tty)");
     println!("  mh \"fix the tests\"              run a task in the foreground");
     println!("  mh run <task> [--detach]        register and request task admission");
     println!("  mh resume [<task-id>]           acquire workspace ownership and continue");
