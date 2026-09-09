@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::identity::{AgentId, ProcessId, RevisionId, TaskId};
+use crate::identity::{AgentId, ExecutionId, ProcessId, RevisionId, TaskId};
 
 /// Lifecycle of a durable task (spec v0.5 §"Task state machine").
 ///
@@ -255,6 +255,8 @@ pub enum FinishObjection {
     UnresolvedAgents { agents: Vec<AgentId> },
     /// Long-lived processes still running under this task.
     RunningProcesses { processes: Vec<ProcessId> },
+    /// PTC executions admitted by a lost runner without a durable outcome.
+    OutcomeUnknownExecutions { executions: Vec<ExecutionId> },
     /// The newest verification of this kind failed.
     FailedVerification { kinds: Vec<String> },
     /// The workspace changed after the last passing verification.
@@ -296,6 +298,11 @@ impl FinishObjection {
                 "{} background process(es) are still running: {}. Wait for or kill them first.",
                 processes.len(),
                 join_ids(processes.iter().map(|process| process.0))
+            ),
+            Self::OutcomeUnknownExecutions { executions } => format!(
+                "{} PTC execution(s) have unknown outcomes: {}. Inspect their effects before retrying or finishing.",
+                executions.len(),
+                join_ids(executions.iter().map(|execution| execution.0))
             ),
             Self::FailedVerification { kinds } => format!(
                 "the newest verification failed for: {}. Fix and re-record evidence.",

@@ -4,9 +4,10 @@ Durable agent runtime for long-running coding tasks, implemented in Rust with
 an embedded MicroQuickJS runtime.
 
 A task is durable. Model calls, context windows, PTC executions, delegated
-workers, and subprocesses are disposable execution mechanisms. A task survives
-many context windows, keeps working while its workers run, owns long-lived
-processes, and resumes after the process that started it exits.
+workers, and subprocesses are disposable execution mechanisms. One canonical
+workspace admits at most one root runner at a time; workers inside that runner
+remain concurrent. A task survives many context windows and can be resumed
+after its owning runner exits.
 
 ## Build
 
@@ -85,20 +86,48 @@ next rollover, so the prompt says exactly that.
 ```sh
 mh                            # interactive REPL
 mh "inspect and fix it"       # start a task in the current workspace
-mh run "..." --detach         # start a task that outlives this command
-mh tasks                      # list durable tasks
-mh inspect <task-id>          # full durable state of one task
-mh attach <task-id>           # show state, then continue it in the foreground
-mh resume [<task-id>]         # continue a durable task
-mh steer <task-id> "..."      # append durable steering
-mh cancel [<task-id>]         # request durable cancellation
+mh run "..." --detach         # register a task, then request detached admission
+mh tasks                      # list durable tasks without changing the workspace
+mh inspect <task-id>          # full durable state of one task, read-only
+mh attach <task-id>           # observation-only state snapshot
+mh resume [<task-id>]         # compete for root runner ownership, then continue
+mh steer <task-id> "..."      # durably queue steering and print its receipt
+mh cancel [<task-id>]         # durably queue cancellation and print its receipt
+mh recover <task-id> execution <id> "reason"  # resolve an audited unknown PTC outcome
+mh recover <task-id> process <id> "reason"    # resolve an audited unknown process outcome
 mh sessions                   # session status and the last answer
 ```
 
-`steer` and `cancel` are journal appends, so they work against a task running
-in another process: the running loop picks them up at its next safe point.
-`tasks` and `inspect` are read-only and never mutate the journal of a live
-task.
+`steer` and `cancel` are journal-only transactions, so they work against a task
+running in another process. Acceptance is durable queueing, not proof that the
+runner has applied the command yet; each command receives an identity and event
+sequence. The running loop applies it at a safe point.
+
+`tasks`, `inspect`, `attach`, and `sessions` are observation-only. They do not
+create `.mh/`, repair journals, migrate state, reconcile workspace drift,
+rewrite process metadata, or resume execution. Use `resume` explicitly to
+compete for ownership. Relative paths, `..`, and symlink aliases resolve to the
+same canonical workspace lock.
+
+The journal under `.mh/session.jsonl` is the source of truth; `state.json` and
+the workspace revision cache are rebuildable caches. A final incomplete JSONL
+frame is reported to readers as a torn tail. The next admitted writer backs up
+that tail and truncates only the invalid suffix. Complete malformed records,
+duplicate or reversed sequences, and invalid known event schemas fail closed.
+
+Recovery is deliberately conservative. A crashed owner can leave workers,
+isolated deltas, PTC/tool calls, or OS subprocesses with unknown outcomes. A new
+owner never adopts, signals, replays, integrates, discards, or declares those
+effects successful merely from stale metadata or a PID. Unresolved resources
+remain visible and block completion. After externally verifying an unknown PTC
+execution or process, `mh recover` acquires runner ownership and records the
+resource ID plus an audit reason; it does not inspect, kill, or replay the
+resource. Isolated deltas are resolved through the existing `integrate` or
+`discard` operations. General shell descendants and machine crashes are not an
+exactly-once execution boundary.
+
+Before upgrading a workspace, stop every older runner. New writers fail closed
+on unsupported formats; mixed old/new writers are not supported.
 
 Session state, compact host-call traces, goal state, worker and process
 lifecycles, and verification evidence are stored under `.mh/` in the current
@@ -332,10 +361,10 @@ process_list();
 loads an unbounded log. Process metadata is durable and visible through task
 inspection, and a running process blocks `finish()`.
 
-An OS process does not survive the runtime that started it. Rather than
-pretend otherwise, recovery marks a process from a previous runtime
-`orphaned`, records whether its recorded pid still appears to exist, and
-reports it that way. Metadata is durable; the process is not.
+An OS process may outlive the runtime that started it. Recovery never adopts or
+signals it from stale metadata. Instead the journal keeps the process outcome
+unknown, records whether its saved PID currently appears alive as diagnostic
+information, and requires explicit audited resolution before completion.
 
 ## Integration
 

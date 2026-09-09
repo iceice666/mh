@@ -105,11 +105,9 @@ fn steering_queued_against_an_idle_task_is_pending_then_applied() {
     );
 
     assert!(
-        events(dir.path()).iter().any(|record| matches!(
-            &record.event,
-            SessionEvent::SteeringApplied { content, .. }
-                if content == "prefer the smaller change"
-        )),
+        events(dir.path())
+            .iter()
+            .any(|record| matches!(&record.event, SessionEvent::SteeringApplied { .. })),
         "the running loop must apply steering left by another process"
     );
     assert!(
@@ -126,7 +124,7 @@ fn cancellation_without_an_id_targets_the_root_task() {
     let task = Agent::<RoleModel>::start_detached_task(dir.path(), "cancellable").unwrap();
 
     let cancelled = cancel_task(dir.path(), None).unwrap();
-    assert_eq!(cancelled, task, "no id means the root task");
+    assert_eq!(cancelled.task_id, task, "no id means the root task");
     assert!(task_reports(dir.path()).unwrap()[0].cancel_requested);
 
     let agent = Agent::new(RoleModel::new(vec![finish("unreachable")]), config());

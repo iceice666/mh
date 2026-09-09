@@ -764,7 +764,7 @@ mod tests {
     fn worker_context_names_its_parent_and_capability_limits() {
         let (mut session, _dir) = session();
         let root = session.begin_task("root").unwrap();
-        let (agent, child) = session.allocate_agent();
+        let (agent, child) = session.reserve_agent().unwrap();
         session
             .append(SessionEvent::AgentSpawned {
                 parent_task_id: root,
@@ -796,7 +796,7 @@ mod tests {
         let (mut session, _dir) = session();
         let root = session.begin_task("orchestrate").unwrap();
         let revision = session.state().current_revision;
-        let (agent, child) = session.allocate_agent();
+        let (agent, child) = session.reserve_agent().unwrap();
         session
             .append(SessionEvent::AgentSpawned {
                 parent_task_id: root,
@@ -822,7 +822,7 @@ mod tests {
             .append(SessionEvent::ProcessSpawned {
                 task_id: root,
                 agent: AgentId::ROOT,
-                process: session.allocate_process(),
+                process: session.reserve_process().unwrap(),
                 argv: vec!["cargo".to_string(), "watch".to_string()],
                 cwd: session.workspace_root(),
                 label: Some("watch".to_string()),
@@ -921,7 +921,7 @@ mod tests {
 
     #[test]
     fn a_parked_task_is_told_it_is_not_complete() {
-        let (mut session, _dir) = session();
+        let (session, _dir) = session();
         let task = session.begin_task("park").unwrap();
         session
             .set_status(task, TaskStatus::WaitingUser, None)
@@ -936,7 +936,7 @@ mod tests {
         let (mut session, _dir) = session();
         let root = session.begin_task("orchestrate").unwrap();
         let revision = session.state().current_revision;
-        let (agent, child) = session.allocate_agent();
+        let (agent, child) = session.reserve_agent().unwrap();
         session
             .append(SessionEvent::AgentSpawned {
                 parent_task_id: root,

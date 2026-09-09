@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use serde_json::Value;
@@ -19,7 +19,7 @@ use crate::identity::{AgentId, IsolatedWorkspaceId, ProcessId, RevisionId, TaskI
 use crate::isolation::IsolationStore;
 use crate::process::{ProcessManager, ProcessSnapshot};
 use crate::ptc::prelude::Prelude;
-use crate::session::{Session, SessionError, SessionEvent};
+use crate::session::{CommandReceipt, Session, SessionError, SessionEvent};
 use crate::workspace::WorkspaceTracker;
 
 /// Shared durable services for one workspace session.
@@ -30,7 +30,6 @@ pub struct Runtime {
     processes: ProcessManager,
     workers: WorkerRegistry,
     prelude: Mutex<Option<Arc<Prelude>>>,
-    next_workspace: AtomicU64,
     workers_started: AtomicUsize,
     budget: DelegationBudget,
 }
@@ -50,7 +49,7 @@ impl Runtime {
         let processes = ProcessManager::open(session.root())
             .map_err(|error| SessionError::State(error.to_string()))?
             .with_max_live(MAX_LIVE_PROCESSES);
-        let next_workspace = session.next_isolated_workspace_id().0;
+        let _ = session.state();
         Ok(Self {
             isolation: IsolationStore::open(&workspace).ok(),
             session,
@@ -58,7 +57,6 @@ impl Runtime {
             processes,
             workers: WorkerRegistry::default(),
             prelude: Mutex::new(None),
-            next_workspace: AtomicU64::new(next_workspace),
             workers_started: AtomicUsize::new(0),
             budget,
         })
@@ -104,9 +102,9 @@ impl Runtime {
         Ok(self.tracker.current_revision()?.id)
     }
 
-    /// Allocates the next isolated workspace id without racing sibling workers.
-    pub fn allocate_workspace(&self) -> IsolatedWorkspaceId {
-        IsolatedWorkspaceId(self.next_workspace.fetch_add(1, Ordering::Relaxed))
+    /// Durably reserves the next isolated workspace id before creating it.
+    pub fn allocate_workspace(&self) -> Result<IsolatedWorkspaceId, SessionError> {
+        self.session.reserve_workspace()
     }
 
     /// Reserves one slot against the per-task child budget.
@@ -496,43 +494,18 @@ pub fn steer_task(
     workspace: &Path,
     task_id: Option<TaskId>,
     message: &str,
-) -> Result<TaskId, SessionError> {
-    let session = Session::resume(workspace)?;
-    let task_id = resolve_active(&session, task_id, "steer")?;
-    session.append_shared_event(SessionEvent::SteeringQueued {
-        task_id,
-        content: message.to_string(),
-    })?;
-    Ok(task_id)
+) -> Result<CommandReceipt, SessionError> {
+    let session = Session::command(workspace)?;
+    session.queue_steering(task_id, message.to_string())
 }
 
 /// Requests durable cancellation of a task.
-pub fn cancel_task(workspace: &Path, task_id: Option<TaskId>) -> Result<TaskId, SessionError> {
-    let session = Session::resume(workspace)?;
-    let task_id = resolve_active(&session, task_id, "cancel")?;
-    session.append_shared_event(SessionEvent::TaskCancelRequested { task_id })?;
-    Ok(task_id)
-}
-
-/// Resolves the target task for a journal command, refusing a terminal one.
-fn resolve_active(
-    session: &Session,
+pub fn cancel_task(
+    workspace: &Path,
     task_id: Option<TaskId>,
-    verb: &str,
-) -> Result<TaskId, SessionError> {
-    let task_id = task_id
-        .or_else(|| session.root_task())
-        .ok_or_else(|| SessionError::State(format!("no task to {verb}")))?;
-    let status = session.task_view(task_id).status();
-    if status.is_active() {
-        Ok(task_id)
-    } else {
-        Err(SessionError::State(format!(
-            "cannot {verb} task {}: already {}",
-            task_id.0,
-            status.label()
-        )))
-    }
+) -> Result<CommandReceipt, SessionError> {
+    let session = Session::command(workspace)?;
+    session.request_cancel(task_id)
 }
 
 /// Serializes a parent-supplied context value under the delegation bound.

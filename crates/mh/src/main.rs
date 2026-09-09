@@ -6,14 +6,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mh::agent::{Agent, AgentConfig, AgentControl, AgentError, AgentEvent, TaskOutcome};
-use mh::identity::TaskId;
+use mh::goal::TaskStatus;
+use mh::identity::{ExecutionId, ProcessId, TaskId};
 use mh::model::{ModelEvent, OpenAiResponses};
 use mh::ptc::{Prelude, TrustDecision};
 use mh::runtime::{TaskReport, cancel_task, steer_task, task_reports};
-use mh::session::{Session, SessionError, SessionEvent, TaskView};
+use mh::session::{Session, SessionError, SessionEvent, TaskView, WorkspaceRunnerLock};
 
 /// Subcommand the detach path re-execs itself with. Deliberately undocumented:
 /// it is an implementation detail of `--detach`, not a user-facing verb.
@@ -103,6 +104,7 @@ fn run() -> Result<(), CliError> {
         Some("inspect") => cmd_inspect(&workspace, rest()),
         Some("steer") => cmd_steer(&workspace, rest()),
         Some("cancel") => cmd_cancel(&workspace, rest()),
+        Some("recover") => cmd_recover(&workspace, rest()),
         Some("sessions") if args.len() == 1 => print_session(&workspace),
         Some(DETACHED_RUNNER) => cmd_run_detached(&workspace, rest(), &cancelled),
         // Anything else is the task itself: `mh "fix the tests"`.
@@ -160,8 +162,10 @@ fn detach_task(workspace: &Path, task: &str) -> Result<(), CliError> {
     }
     let log = fs::File::create(&log_path)?;
     let errors = log.try_clone()?;
+    let admission_path = log_path.with_extension(format!("{}.admission", std::process::id()));
+    let _ = fs::remove_file(&admission_path);
     let exe = std::env::current_exe()?;
-    Command::new(exe)
+    let mut child = Command::new(exe)
         .arg(DETACHED_RUNNER)
         .arg(task_id.0.to_string())
         .current_dir(workspace)
@@ -170,9 +174,15 @@ fn detach_task(workspace: &Path, task: &str) -> Result<(), CliError> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(errors))
+        .env("MH_DETACHED_ADMISSION_FILE", &admission_path)
         .spawn()?;
-    // Deliberately not waited on: the point of --detach is to return now.
-    eprintln!("[detach] task {} started", task_id.0);
+    wait_for_detached_admission(&mut child, &admission_path).map_err(|error| {
+        CliError::Model(format!(
+            "task {} queued but not admitted: {error}",
+            task_id.0
+        ))
+    })?;
+    eprintln!("[detach] task {} admitted", task_id.0);
     eprintln!("[detach] log {}", log_path.display());
     eprintln!(
         "[detach] steer with `mh steer {} \"...\"`, watch with `mh inspect {}`",
@@ -193,13 +203,79 @@ fn cmd_run_detached(
         )));
     };
     let task_id = parse_task_id(id)?;
-    let agent = new_agent()?;
-    let mut printer = EventPrinter::new();
-    let outcome = agent.resume_task(workspace, Some(task_id), cancelled, None, &mut |event| {
-        printer.print(event);
-    })?;
-    report_outcome(&outcome);
-    Ok(())
+    let result: Result<(), CliError> = (|| {
+        let agent = new_agent()?;
+        let mut printer = EventPrinter::new();
+        let mut admitted = || {
+            let path = std::env::var("MH_DETACHED_ADMISSION_FILE").map_err(|error| {
+                AgentError::Session(SessionError::State(format!(
+                    "detached admission channel missing: {error}"
+                )))
+            })?;
+            fs::write(path, b"admitted\n").map_err(SessionError::from)?;
+            Ok(())
+        };
+        let outcome = agent.resume_task_admitted(
+            workspace,
+            Some(task_id),
+            cancelled,
+            None,
+            &mut admitted,
+            &mut |event| printer.print(event),
+        )?;
+        report_outcome(&outcome);
+        Ok(())
+    })();
+    if let Err(error) = &result
+        && let Ok(path) = std::env::var("MH_DETACHED_ADMISSION_FILE")
+        && !Path::new(&path).exists()
+    {
+        let _ = fs::write(path, format!("{error}\n"));
+    }
+    if let Err(error) = &result
+        && !matches!(
+            error,
+            CliError::Session(SessionError::Busy(_))
+                | CliError::Agent(AgentError::Session(SessionError::Busy(_)))
+        )
+        && let Ok(session) = Session::command(workspace)
+        && session.task_view(task_id).status().is_active()
+    {
+        let _ = session.set_status(task_id, TaskStatus::Blocked, Some(error.to_string()));
+    }
+    result
+}
+
+fn wait_for_detached_admission(
+    child: &mut std::process::Child,
+    path: &Path,
+) -> Result<(), CliError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(message) = fs::read_to_string(path)
+            && message.ends_with('\n')
+        {
+            let _ = fs::remove_file(path);
+            if message.trim() == "admitted" {
+                return Ok(());
+            }
+            return Err(CliError::Model(format!(
+                "detached admission failed: {}",
+                message.trim()
+            )));
+        }
+        if let Some(status) = child.try_wait()? {
+            return Err(CliError::Model(format!(
+                "detached runner exited before admission ({status})"
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(CliError::Model(
+                "timed out waiting for detached runner admission".to_string(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn cmd_resume(
@@ -225,51 +301,29 @@ fn cmd_resume(
     Ok(())
 }
 
-/// `mh attach <task-id>`: report the task's durable state, then drive it here.
+/// `mh attach <task-id>`: report the task's current durable state.
 ///
-/// There is no way to take over a loop already running in another process, so
-/// attach does the two honest things it can: it shows the durable state, and it
-/// continues an active task in this process. Which one happened is stated
-/// explicitly rather than left to be inferred from the output.
+/// Streaming attachment is not available without a daemon. Continuing work is
+/// an explicit `mh resume`, which must first acquire workspace ownership.
 fn cmd_attach(
     workspace: &Path,
     args: Vec<String>,
-    cancelled: &Arc<AtomicBool>,
+    _cancelled: &Arc<AtomicBool>,
 ) -> Result<(), CliError> {
     let [id] = args.as_slice() else {
         return Err(CliError::Usage("attach needs one task id".to_string()));
     };
     let task_id = parse_task_id(id)?;
-    // Read-only first: attaching must not disturb a task already running
-    // elsewhere, and the full view is what makes the state legible.
     let session = Session::inspect(workspace)?;
     if !session.tasks().iter().any(|view| view.task_id == task_id) {
         return Err(CliError::NoTask(task_id.0));
     }
     let view = session.task_view(task_id);
-    let status = view.status();
     print_task_view(&view);
-    drop(session);
-
-    if !status.is_active() {
-        eprintln!(
-            "[attach] task {} is {}; nothing left to drive.",
-            task_id.0,
-            status.label()
-        );
-        return Ok(());
-    }
     eprintln!(
-        "[attach] task {} is {}; driving it in this process.",
-        task_id.0,
-        status.label()
+        "[attach] observation only; use `mh resume {}` to compete for runner ownership.",
+        task_id.0
     );
-    let agent = new_agent()?;
-    let mut printer = EventPrinter::new();
-    let outcome = agent.resume_task(workspace, Some(task_id), cancelled, None, &mut |event| {
-        printer.print(event);
-    })?;
-    report_outcome(&outcome);
     Ok(())
 }
 
@@ -444,6 +498,16 @@ fn print_task_view(view: &TaskView) {
             record.argv.join(" ")
         )
     });
+    print_section(
+        "outcome-unknown executions",
+        &view.outcome_unknown_executions,
+        |execution| execution.0.to_string(),
+    );
+    print_section(
+        "unresolved recovery workspaces",
+        &view.unresolved_recovery_workspaces,
+        u64::to_string,
+    );
 }
 
 fn print_section<T>(title: &str, items: &[T], render: impl Fn(&T) -> String) {
@@ -465,8 +529,14 @@ fn cmd_steer(workspace: &Path, args: Vec<String>) -> Result<(), CliError> {
             ));
         }
     };
-    let task_id = steer_task(workspace, Some(parse_task_id(id)?), &message)?;
-    eprintln!("[steering] queued for task {}", task_id.0);
+    let receipt = steer_task(workspace, Some(parse_task_id(id)?), &message)?;
+    eprintln!(
+        "[steering] queued for task {} as command {} (event {})",
+        receipt.task_id.0, receipt.command_id, receipt.seq
+    );
+    if let Some(warning) = &receipt.cache_warning {
+        eprintln!("[steering] warning: {warning}");
+    }
     Ok(())
 }
 
@@ -480,8 +550,49 @@ fn cmd_cancel(workspace: &Path, args: Vec<String>) -> Result<(), CliError> {
             ));
         }
     };
-    let task_id = cancel_task(workspace, task_id)?;
-    eprintln!("[cancel] requested for task {}", task_id.0);
+    let receipt = cancel_task(workspace, task_id)?;
+    eprintln!(
+        "[cancel] requested for task {} as command {} (event {})",
+        receipt.task_id.0, receipt.command_id, receipt.seq
+    );
+    if let Some(warning) = &receipt.cache_warning {
+        eprintln!("[cancel] warning: {warning}");
+    }
+    Ok(())
+}
+
+fn cmd_recover(workspace: &Path, args: Vec<String>) -> Result<(), CliError> {
+    let [task, kind, id, reason @ ..] = args.as_slice() else {
+        return Err(CliError::Usage(
+            "recover needs <task-id> <execution|process> <resource-id> <reason>".to_string(),
+        ));
+    };
+    if reason.is_empty() {
+        return Err(CliError::Usage("recover needs an audit reason".to_string()));
+    }
+    let task_id = parse_task_id(task)?;
+    let resource_id = id
+        .parse::<u64>()
+        .map_err(|_| CliError::Usage(format!("`{id}` is not a resource id")))?;
+    let (execution_id, process_id) = match kind.as_str() {
+        "execution" => (Some(ExecutionId(resource_id)), None),
+        "process" => (None, Some(ProcessId(resource_id))),
+        _ => {
+            return Err(CliError::Usage(
+                "recover resource kind must be `execution` or `process`".to_string(),
+            ));
+        }
+    };
+    let lock = WorkspaceRunnerLock::acquire(workspace)?;
+    let session = Session::resume(workspace)?;
+    let runner = session.admit_runner(lock, Some(task_id))?;
+    session.recover_previous_owner(runner.info().generation)?;
+    session.refresh()?;
+    let record = runner.resolve_recovery(task_id, execution_id, process_id, reason.join(" "))?;
+    eprintln!(
+        "[recovery] resolved {kind} {resource_id} for task {} (event {})",
+        task_id.0, record.seq
+    );
     Ok(())
 }
 
@@ -978,28 +1089,64 @@ fn install_ctrl_c() -> Result<Arc<AtomicBool>, CliError> {
 }
 
 fn print_help() {
-    println!("mh — minimal PTC coding agent");
+    println!("mh — durable PTC coding agent");
     println!();
     println!("USAGE:");
     println!("  mh                              open an interactive session");
     println!("  mh \"fix the tests\"              run a task in the foreground");
-    println!("  mh run <task> [--detach]        run a task; --detach returns immediately");
-    println!("  mh resume [<task-id>]           continue a durable task in the foreground");
-    println!("  mh attach <task-id>             show a task's state, then continue it here");
-    println!("  mh tasks                        list durable tasks");
-    println!("  mh inspect <task-id>            full durable state of one task");
-    println!("  mh steer <task-id> <message>    append durable steering");
-    println!("  mh cancel [<task-id>]           request durable cancellation");
+    println!("  mh run <task> [--detach]        register and request task admission");
+    println!("  mh resume [<task-id>]           acquire workspace ownership and continue");
+    println!("  mh attach <task-id>             show an observation-only task snapshot");
+    println!("  mh tasks                        list durable tasks without mutation");
+    println!("  mh inspect <task-id>            full read-only durable state");
+    println!("  mh steer <task-id> <message>    queue durable steering with a receipt");
+    println!("  mh cancel [<task-id>]           queue durable cancellation with a receipt");
+    println!("  mh recover <task-id> <execution|process> <id> <reason>");
     println!("  mh sessions                     inspect the workspace session");
     println!("  mh --help | --version");
-    println!();
-    println!("A detached run logs to .mh/tasks/<task-id>.log. Steering and cancellation go");
-    println!("through the session journal, so they reach a run in another process. `tasks`");
-    println!("and `inspect` are read-only and never disturb a running task.");
     println!();
     println!("ENVIRONMENT:");
     println!("  MH_API_KEY or OPENAI_API_KEY");
     println!("  MH_BASE_URL             Responses API root; default: https://api.openai.com/v1");
     println!("  MH_MODEL                default: gpt-4.1-mini");
     println!("  MH_MODEL_TIMEOUT_SECS   default: 300");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ADMISSION_CHILD: &str = "MH_ADMISSION_WAIT_CHILD";
+
+    #[test]
+    fn admission_wait_child() {
+        if std::env::var_os(ADMISSION_CHILD).is_some() {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    }
+
+    #[test]
+    fn detached_admission_waits_for_a_complete_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("admission");
+        fs::write(&path, b"admitted").unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::admission_wait_child", "--nocapture"])
+            .env(ADMISSION_CHILD, "1")
+            .spawn()
+            .unwrap();
+        let completed = path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let mut file = fs::OpenOptions::new().append(true).open(completed).unwrap();
+            file.write_all(b"\n").unwrap();
+        });
+
+        wait_for_detached_admission(&mut child, &path).unwrap();
+
+        writer.join().unwrap();
+        assert!(!path.exists());
+        let status = child.wait().unwrap();
+        assert!(status.success());
+    }
 }

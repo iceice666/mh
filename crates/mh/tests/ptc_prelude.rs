@@ -549,7 +549,10 @@ fn the_session_journal_records_the_active_prelude() {
         })
         .expect("the load is durable, not just a console line");
     assert_eq!(logged.0, expected);
-    assert_eq!(logged.1, dir.path().join(WORKSPACE_PRELUDE));
+    assert_eq!(
+        logged.1,
+        dir.path().canonicalize().unwrap().join(WORKSPACE_PRELUDE)
+    );
     assert!(logged.2);
 }
 
@@ -564,6 +567,10 @@ fn run_agent(dir: &Path, config: AgentConfig) -> Vec<AgentEvent> {
             &Arc::new(AtomicBool::new(false)),
             &mut |event| seen.push(event),
         )
+        .unwrap();
+    let session = Session::resume(dir).unwrap();
+    session
+        .interrupt_task(session.root_task().expect("synthetic task exists"))
         .unwrap();
     seen
 }

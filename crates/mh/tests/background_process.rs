@@ -239,6 +239,53 @@ fn a_background_process_accepts_stdin() {
     );
 }
 
+#[test]
+fn a_settled_worker_journals_its_process_teardown() {
+    let dir = repository();
+    let (outcome, _) = run(
+        dir.path(),
+        RoleModel::new(vec![
+            program(
+                r#"
+                var worker = agent_spawn({ task: "spawn worker process", access: "isolated-write" });
+                var result = agent_join(worker.agent);
+                return { workerOk: result.ok };
+                "#,
+            ),
+            finish("worker process was cleaned up"),
+        ])
+        .worker(
+            "spawn worker process",
+            vec![
+                program(
+                    r#"
+                    var process = process_spawn({
+                        command: ["/bin/sh", "-c", "sleep 30"],
+                        label: "worker-owned"
+                    });
+                    return { process: process.id };
+                    "#,
+                ),
+                text("worker done"),
+            ],
+        ),
+        "worker process teardown",
+        config(),
+    );
+
+    assert!(outcome.is_complete());
+    let session = Session::inspect(dir.path()).unwrap();
+    let root = session.root_task().unwrap();
+    let view = session.task_view(root);
+    assert_eq!(view.status(), TaskStatus::Completed);
+    assert_eq!(view.processes.len(), 1);
+    assert!(!view.processes[0].is_running());
+    assert!(events(dir.path()).iter().any(|record| matches!(
+        record.event,
+        SessionEvent::ProcessStateChanged { process, .. } if process == view.processes[0].process
+    )));
+}
+
 /// Spec: after a runtime restart the recovered task must clearly represent
 /// task status, worker states, workspace revision, compacted context, and
 /// process states/orphans. No silent state loss.

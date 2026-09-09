@@ -429,19 +429,29 @@ impl<M: Model + 'static> Agent<M> {
         controls: Option<&Receiver<AgentControl>>,
         events: &mut dyn FnMut(AgentEvent),
     ) -> Result<TaskOutcome, AgentError> {
-        let mut session = Session::open(workspace)?;
+        let lock = crate::session::WorkspaceRunnerLock::acquire(workspace)?;
+        let session = Session::open(workspace)?;
+        let runner = session.admit_runner(lock, None)?;
+        session.recover_previous_owner(runner.info().generation)?;
         let task_id = session.begin_task(task)?;
-        session.append(SessionEvent::UserMessage {
+        session.append_shared_event(SessionEvent::UserMessage {
             task_id,
             content: task.to_string(),
         })?;
-        self.drive(session, task_id, cancelled, controls, events)
+        self.drive(
+            session,
+            task_id,
+            cancelled,
+            controls,
+            &mut || Ok(()),
+            events,
+        )
     }
 
     /// Starts a task without running it, for a detached launch.
     pub fn start_detached_task(workspace: &Path, task: &str) -> Result<TaskId, AgentError> {
-        let mut session = Session::open(workspace)?;
-        let task_id = session.begin_task(task)?;
+        let mut session = Session::registration(workspace)?;
+        let task_id = session.register_queued_task(task)?;
         session.append(SessionEvent::UserMessage {
             task_id,
             content: task.to_string(),
@@ -489,7 +499,32 @@ impl<M: Model + 'static> Agent<M> {
         controls: Option<&Receiver<AgentControl>>,
         events: &mut dyn FnMut(AgentEvent),
     ) -> Result<TaskOutcome, AgentError> {
+        self.resume_task_admitted(
+            workspace,
+            task_id,
+            cancelled,
+            controls,
+            &mut || Ok(()),
+            events,
+        )
+    }
+
+    /// Continues a root task and acknowledges only after runner ownership and
+    /// task eligibility have both been established.
+    pub fn resume_task_admitted(
+        &self,
+        workspace: &Path,
+        task_id: Option<TaskId>,
+        cancelled: &Arc<AtomicBool>,
+        controls: Option<&Receiver<AgentControl>>,
+        admitted: &mut dyn FnMut() -> Result<(), AgentError>,
+        events: &mut dyn FnMut(AgentEvent),
+    ) -> Result<TaskOutcome, AgentError> {
+        let lock = crate::session::WorkspaceRunnerLock::acquire(workspace)?;
         let session = Session::resume(workspace)?;
+        let runner = session.admit_runner(lock, task_id)?;
+        session.recover_previous_owner(runner.info().generation)?;
+        session.refresh()?;
         let task_id = match task_id.or_else(|| session.root_task()) {
             Some(task_id) => task_id,
             None => {
@@ -498,14 +533,21 @@ impl<M: Model + 'static> Agent<M> {
                 )));
             }
         };
-        if !session.task_view(task_id).status().is_active() {
+        let view = session.task_view(task_id);
+        if !view.agent.is_root() {
+            return Err(AgentError::Session(SessionError::State(format!(
+                "task {} is delegated child agent {}; only root tasks can be resumed",
+                task_id.0, view.agent.0
+            ))));
+        }
+        if !view.status().is_active() {
             return Err(AgentError::Session(SessionError::State(format!(
                 "task {} already {}",
                 task_id.0,
-                session.task_view(task_id).status().label()
+                view.status().label()
             ))));
         }
-        self.drive(session, task_id, cancelled, controls, events)
+        self.drive(session, task_id, cancelled, controls, admitted, events)
     }
 
     pub fn send_message(
@@ -538,7 +580,11 @@ impl<M: Model + 'static> Agent<M> {
         controls: Option<&Receiver<AgentControl>>,
         events: &mut dyn FnMut(AgentEvent),
     ) -> Result<TaskOutcome, AgentError> {
-        let mut session = Session::open(workspace)?;
+        let lock = crate::session::WorkspaceRunnerLock::acquire(workspace)?;
+        let session = Session::open(workspace)?;
+        let runner = session.admit_runner(lock, None)?;
+        session.recover_previous_owner(runner.info().generation)?;
+        session.refresh()?;
         let parked = session
             .root_task()
             .filter(|task_id| session.task_view(*task_id).status().is_active());
@@ -546,11 +592,18 @@ impl<M: Model + 'static> Agent<M> {
             Some(task_id) => task_id,
             None => session.begin_task(message)?,
         };
-        session.append(SessionEvent::UserMessage {
+        session.append_shared_event(SessionEvent::UserMessage {
             task_id,
             content: message.to_string(),
         })?;
-        self.drive(session, task_id, cancelled, controls, events)
+        self.drive(
+            session,
+            task_id,
+            cancelled,
+            controls,
+            &mut || Ok(()),
+            events,
+        )
     }
 
     /// Sets up durable services and runs the task's context windows.
@@ -560,6 +613,7 @@ impl<M: Model + 'static> Agent<M> {
         task_id: TaskId,
         cancelled: &Arc<AtomicBool>,
         controls: Option<&Receiver<AgentControl>>,
+        admitted: &mut dyn FnMut() -> Result<(), AgentError>,
         events: &mut dyn FnMut(AgentEvent),
     ) -> Result<TaskOutcome, AgentError> {
         let workspace = session.state().workspace.clone();
@@ -584,16 +638,10 @@ impl<M: Model + 'static> Agent<M> {
             session,
             self.config.delegation_budget.clone(),
         )?);
+        runtime.recover_processes();
         runtime.set_prelude(prelude.clone());
-        // A previous runtime's processes cannot have survived it; say so
-        // instead of pretending they are live.
-        for snapshot in runtime.recover_processes() {
-            events(AgentEvent::ProcessExited {
-                process: snapshot.id,
-                exit_code: snapshot.exit_code,
-            });
-        }
-
+        // Cross-runtime resources were conservatively reconciled after runner
+        // admission. Unknown subprocess outcomes remain visible and blocked.
         let host = Arc::new(AgentRuntimeHost::new(
             self.model.clone(),
             self.compiler_with_prelude(prelude.as_deref()),
@@ -601,6 +649,7 @@ impl<M: Model + 'static> Agent<M> {
             runtime.clone(),
             cancelled.clone(),
         ));
+        admitted()?;
         let outcome = self.run_windows(
             &runtime,
             Some(host.clone() as Arc<dyn DelegationHost>),
@@ -823,7 +872,7 @@ impl<M: Model + 'static> Agent<M> {
                         continue;
                     }
                     check_cancelled(session, task_id, cancelled)?;
-                    let execution_id = session.begin_execution();
+                    let execution_id = session.reserve_execution()?;
                     let start_revision = runtime
                         .tracker()
                         .current_revision()
@@ -1096,7 +1145,10 @@ impl<M: Model + 'static> AgentRuntimeHost<M> {
             .runtime
             .isolation()
             .ok_or("isolated-write requires a Git-root workspace")?;
-        let workspace = self.runtime.allocate_workspace();
+        let workspace = self
+            .runtime
+            .allocate_workspace()
+            .map_err(|error| error.to_string())?;
         isolation
             .create(workspace, task_id, ExecutionId(agent.0), revision.clone())
             .map_err(|error| error.to_string())?;
@@ -1156,7 +1208,9 @@ impl<M: Model + 'static> AgentRuntimeHost<M> {
 
         // Whatever happened, the worker must not leave processes running: its
         // parent can no longer see them.
-        self.runtime.processes().kill_agent(agent);
+        for process in self.runtime.processes().kill_agent(agent) {
+            self.record_terminal_process(&process);
+        }
         let view = session.task_view(task_id);
         let final_record = workspace_id.and_then(|id| {
             self.runtime
@@ -1232,7 +1286,7 @@ impl<M: Model + 'static> DelegationHost for AgentRuntimeHost<M> {
         let (access, profile) = options.resolve()?;
         self.runtime.reserve_worker_slot()?;
         let session = self.session();
-        let (agent, task_id) = session.allocate_agent();
+        let (agent, task_id) = session.reserve_agent().map_err(|error| error.to_string())?;
 
         let workspace = match self.prepare_workspace(access, agent, task_id, revision) {
             Ok(workspace) => workspace,
@@ -1524,6 +1578,7 @@ impl<M: Model + 'static> DelegationHost for AgentRuntimeHost<M> {
         // Poll workers first: a worker that finished a moment ago should not
         // block completion just because nothing has observed it yet.
         self.reap_settled_workers();
+        session.refresh().map_err(|error| error.to_string())?;
         let view = session.task_view(parent.task_id);
         let verdict = validate_finish(&view, &request);
         session
@@ -1561,7 +1616,9 @@ impl<M: Model + 'static> DelegationHost for AgentRuntimeHost<M> {
             Some(AgentAccess::Read) => Capabilities::read_only(&workspace),
             _ => Capabilities::new(&workspace),
         };
-        let process = session.allocate_process();
+        let process = session
+            .reserve_process()
+            .map_err(|error| error.to_string())?;
         let snapshot = self
             .runtime
             .processes()
@@ -1746,14 +1803,8 @@ fn apply_steering(
     repeated: &mut RepeatState,
 ) -> Result<(), AgentError> {
     for content in steering {
-        session.append_shared_event(SessionEvent::SteeringQueued {
-            task_id,
-            content: content.clone(),
-        })?;
-        session.append_shared_event(SessionEvent::SteeringApplied {
-            task_id,
-            content: content.clone(),
-        })?;
+        let receipt = session.queue_steering(Some(task_id), content.clone())?;
+        session.apply_steering_command(task_id, receipt.command_id)?;
         events(AgentEvent::SteeringApplied { content });
     }
     *repeated = RepeatState::default();
@@ -1769,11 +1820,8 @@ fn apply_durable_steering(
     repeated: &mut RepeatState,
 ) -> Result<(), AgentError> {
     let view = session.task_view(task_id);
-    for content in view.pending_steering {
-        session.append_shared_event(SessionEvent::SteeringApplied {
-            task_id,
-            content: content.clone(),
-        })?;
+    for (command_id, content) in session.pending_steering_commands(task_id) {
+        session.apply_steering_command(task_id, command_id)?;
         events(AgentEvent::SteeringApplied { content });
         *repeated = RepeatState::default();
     }
@@ -2279,11 +2327,37 @@ mod tests {
         assert!(outcome.is_complete());
         let session = Session::resume(dir.path()).unwrap();
         assert!(
-            session.events().iter().any(|record| matches!(
-                &record.event,
-                SessionEvent::SteeringApplied { content, .. } if content == "also check the docs"
-            )),
+            session
+                .events()
+                .iter()
+                .any(|record| matches!(&record.event, SessionEvent::SteeringApplied { .. })),
             "durable steering must be applied by the running task"
+        );
+    }
+
+    #[test]
+    fn durable_steering_resets_repeated_action_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = Session::open(dir.path()).unwrap();
+        let task = session.begin_task("detached").unwrap();
+        let receipt = session
+            .queue_steering(Some(task), "change course".to_string())
+            .unwrap();
+        let mut repeated = RepeatState {
+            normalized_source: Some("return read(\"missing\");".to_string()),
+            fingerprint: Some("repeat".to_string()),
+            identical_executions: 2,
+        };
+
+        apply_durable_steering(&session, task, &mut |_| {}, &mut repeated).unwrap();
+
+        assert_eq!(repeated.identical_executions, 0);
+        assert!(repeated.normalized_source.is_none());
+        assert!(
+            !session
+                .pending_steering_commands(task)
+                .iter()
+                .any(|(command_id, _)| *command_id == receipt.command_id)
         );
     }
 

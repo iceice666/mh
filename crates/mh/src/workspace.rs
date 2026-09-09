@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -301,11 +302,20 @@ fn persist_cache(path: &Path, state: &RevisionCache) -> Result<(), WorkspaceErro
         path: path.to_path_buf(),
         message: e.to_string(),
     })?;
-    let tmp = path.with_extension("json.tmp");
-    let mut file = fs::File::create(&tmp).map_err(|source| WorkspaceError::Io {
-        path: tmp.clone(),
-        source,
-    })?;
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_file_name(format!(
+        ".revision-cache.{}.{}.tmp",
+        std::process::id(),
+        TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|source| WorkspaceError::Io {
+            path: tmp.clone(),
+            source,
+        })?;
     file.write_all(&bytes)
         .and_then(|()| file.sync_all())
         .map_err(|source| WorkspaceError::Io {
