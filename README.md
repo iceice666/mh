@@ -15,6 +15,14 @@ after its owning runner exits.
 cargo build -p mh
 ```
 
+The terminal UI has a real-PTY smoke test, which the `cargo test` suite cannot
+cover because it needs a controlling terminal. It uses Python's standard
+library only, on Darwin or Linux:
+
+```sh
+python3 crates/mh/tests/support/tui_smoke.py --binary target/debug/mh
+```
+
 The workspace vendors MicroQuickJS and builds it through
 `crates/mh-quickjs-sys/build.rs`; no system JavaScript runtime is required.
 
@@ -84,7 +92,7 @@ next rollover, so the prompt says exactly that.
 ## Use
 
 ```sh
-mh                            # interactive REPL
+mh                            # conversational UI on a terminal; text REPL otherwise
 mh "inspect and fix it"       # start a task in the current workspace
 mh run "..." --detach         # register a task, then request detached admission
 mh tasks                      # list durable tasks without changing the workspace
@@ -97,6 +105,20 @@ mh recover <task-id> execution <id> "reason"  # resolve an audited unknown PTC o
 mh recover <task-id> process <id> "reason"    # resolve an audited unknown process outcome
 mh sessions                   # session status and the last answer
 ```
+
+On an interactive terminal, bare `mh` opens a full-screen conversation with a
+task sidebar. It starts read-only: the first screen needs no API key, creates
+no `.mh/`, takes no runner lock, and resumes nothing. `Tab` cycles focus,
+`Enter` sends, `Alt-Enter` inserts a newline, `Ctrl-N` starts a new task,
+`Ctrl-R` resumes the selected task, `Ctrl-X` queues durable cancellation,
+`Ctrl-C` interrupts a local run, `Ctrl-Q` exits, and `F1` lists the rest.
+
+Every action names the task you selected, so the task on screen is the task the
+command reaches. A task owned by another process is observable and can be
+durably steered or cancelled, but its token stream is not available: only a run
+this process owns streams live. Steering a local run is passed to it directly
+and becomes durable exactly once. When stdin, stdout, or stderr is not a
+terminal, or `TERM=dumb`, `mh` uses the line-based REPL instead.
 
 `steer` and `cancel` are journal-only transactions, so they work against a task
 running in another process. Acceptance is durable queueing, not proof that the
