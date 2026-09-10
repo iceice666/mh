@@ -56,6 +56,12 @@ task as `waiting-user`, but it never completes it. This matters for long
 horizons, because a model reports progress constantly while the objective is
 still open.
 
+A completed task remains available as conversation context. Sending another
+message while that completed task is selected starts a new linked task, keeps
+the completed task immutable, and includes the recent conversation in the new
+task's model context. `Ctrl-N` still starts an unrelated task with no inherited
+conversation.
+
 `finish()` is validated against durable state and refused — as a value the
 program can branch on, not an exception — while any of these hold:
 

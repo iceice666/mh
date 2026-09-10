@@ -459,6 +459,28 @@ impl<M: Model + 'static> Agent<M> {
         session.set_status(task_id, TaskStatus::Queued, None)?;
         Ok(task_id)
     }
+    /// Starts a queued task that continues a completed task's conversation.
+    pub fn start_detached_followup_task(
+        workspace: &Path,
+        previous_task: TaskId,
+        message: &str,
+    ) -> Result<TaskId, AgentError> {
+        let session = Session::registration(workspace)?;
+        Self::register_followup(&session, previous_task, message)
+    }
+
+    fn register_followup(
+        session: &Session,
+        previous_task: TaskId,
+        message: &str,
+    ) -> Result<TaskId, AgentError> {
+        let task_id = session.register_queued_followup_task(previous_task, message)?;
+        session.append_shared_event(SessionEvent::UserMessage {
+            task_id,
+            content: message.to_string(),
+        })?;
+        Ok(task_id)
+    }
 
     pub fn resume(
         &self,
@@ -571,7 +593,7 @@ impl<M: Model + 'static> Agent<M> {
     }
 
     /// Delivers a user message. An active parked task continues; otherwise a
-    /// new task starts.
+    /// completed root task becomes the conversation parent of a new task.
     pub fn send_message_controlled(
         &self,
         workspace: &Path,
@@ -585,17 +607,28 @@ impl<M: Model + 'static> Agent<M> {
         let runner = session.admit_runner(lock, None)?;
         session.recover_previous_owner(runner.info().generation)?;
         session.refresh()?;
-        let parked = session
-            .root_task()
-            .filter(|task_id| session.task_view(*task_id).status().is_active());
-        let task_id = match parked {
-            Some(task_id) => task_id,
-            None => session.begin_task(message)?,
+        let root = session.root_task();
+        let active = root.filter(|task_id| session.task_view(*task_id).status().is_active());
+        let (task_id, needs_message) = match active {
+            Some(task_id) => (task_id, true),
+            None => match root {
+                Some(previous_task)
+                    if session.task_view(previous_task).status() == TaskStatus::Completed =>
+                {
+                    (
+                        Self::register_followup(&session, previous_task, message)?,
+                        false,
+                    )
+                }
+                _ => (session.begin_task(message)?, true),
+            },
         };
-        session.append_shared_event(SessionEvent::UserMessage {
-            task_id,
-            content: message.to_string(),
-        })?;
+        if needs_message {
+            session.append_shared_event(SessionEvent::UserMessage {
+                task_id,
+                content: message.to_string(),
+            })?;
+        }
         self.drive(
             session,
             task_id,
@@ -604,6 +637,20 @@ impl<M: Model + 'static> Agent<M> {
             &mut || Ok(()),
             events,
         )
+    }
+    /// Delivers a message after task completion as a new task linked to the
+    /// completed conversation. The completed task remains immutable.
+    pub fn send_followup_controlled(
+        &self,
+        workspace: &Path,
+        previous_task: TaskId,
+        message: &str,
+        cancelled: &Arc<AtomicBool>,
+        controls: Option<&Receiver<AgentControl>>,
+        events: &mut dyn FnMut(AgentEvent),
+    ) -> Result<TaskOutcome, AgentError> {
+        let task_id = Self::start_detached_followup_task(workspace, previous_task, message)?;
+        self.resume_task(workspace, Some(task_id), cancelled, controls, events)
     }
 
     /// Sets up durable services and runs the task's context windows.
@@ -2146,6 +2193,70 @@ mod tests {
             1,
             "rollover keeps the same durable task id"
         );
+    }
+
+    struct ContextModel {
+        output: Mutex<Option<ModelOutput>>,
+        seen: Arc<Mutex<Option<String>>>,
+    }
+
+    impl Model for ContextModel {
+        fn generate(
+            &self,
+            context: &CompiledContext,
+            _stop: &GenerationStop,
+            _events: &mut dyn FnMut(ModelEvent),
+        ) -> Result<ModelOutput, ModelError> {
+            *self.seen.lock().unwrap() = Some(context.render());
+            self.output
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or_else(|| ModelError::Protocol("context model exhausted".to_string()))
+        }
+    }
+
+    #[test]
+    fn completed_task_followup_starts_linked_task_with_conversation_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Agent::new(ScriptedModel::new(vec![finish("first done")]), config());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        assert!(
+            first
+                .run_task_controlled(dir.path(), "first request", &cancelled, None, &mut |_| {})
+                .unwrap()
+                .is_complete()
+        );
+        let seen = Arc::new(Mutex::new(None));
+        let second = Agent::new(
+            ContextModel {
+                output: Mutex::new(Some(ModelOutput::Text("follow-up answer".to_string()))),
+                seen: seen.clone(),
+            },
+            config(),
+        );
+        let outcome = second
+            .send_message_controlled(
+                dir.path(),
+                "explain that result",
+                &cancelled,
+                None,
+                &mut |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            outcome,
+            TaskOutcome::AwaitingUser("follow-up answer".to_string())
+        );
+
+        let session = Session::resume(dir.path()).unwrap();
+        let tasks = session.tasks();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].status(), TaskStatus::Completed);
+        assert_eq!(tasks[1].previous_task, Some(tasks[0].task_id));
+        let rendered = seen.lock().unwrap().clone().unwrap();
+        assert!(rendered.contains("first request"), "{rendered}");
+        assert!(rendered.contains("explain that result"), "{rendered}");
     }
 
     /// Routes turns by role and gates the worker, so the root provably calls

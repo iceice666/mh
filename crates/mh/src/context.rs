@@ -6,6 +6,8 @@
 //! workers, processes, the previous window's checkpoint — plus the events of
 //! the current window only.
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::delegation::AgentAccess;
@@ -194,29 +196,51 @@ impl ContextCompiler {
             render_work_state(view),
         ));
 
-        // Only the current window's events. Earlier windows are represented by
-        // their checkpoint, which is the point of rolling over.
+        let conversation_tasks = conversation_task_ids(view, events);
+        // Current-window events plus the bounded recent dialogue inherited
+        // from completed conversation ancestors.
         let window = events
             .iter()
             .filter(|record| {
-                record.seq >= view.window_start_seq && record.event.task_id() == Some(view.task_id)
+                (record.seq >= view.window_start_seq
+                    && record.event.task_id() == Some(view.task_id))
+                    || record
+                        .event
+                        .task_id()
+                        .is_some_and(|task_id| conversation_tasks.contains(&task_id))
             })
             .collect::<Vec<_>>();
-        let latest_assistant_seq = window.iter().rev().find_map(|record| {
-            matches!(record.event, SessionEvent::AssistantMessage { .. }).then_some(record.seq)
-        });
+        let latest_assistant_seq = window
+            .iter()
+            .rev()
+            .find_map(|record| {
+                (record.event.task_id() == Some(view.task_id)
+                    && matches!(record.event, SessionEvent::AssistantMessage { .. }))
+                .then_some(record.seq)
+            })
+            .or_else(|| {
+                window.iter().rev().find_map(|record| {
+                    matches!(record.event, SessionEvent::AssistantMessage { .. })
+                        .then_some(record.seq)
+                })
+            });
         let latest_user_seq = window.iter().rev().find_map(|record| {
-            matches!(
-                record.event,
-                SessionEvent::UserMessage { .. } | SessionEvent::SteeringApplied { .. }
-            )
+            (record.event.task_id() == Some(view.task_id)
+                && matches!(
+                    record.event,
+                    SessionEvent::UserMessage { .. } | SessionEvent::SteeringApplied { .. }
+                ))
             .then_some(record.seq)
         });
         let latest_completed_seq = window.iter().rev().find_map(|record| {
-            matches!(record.event, SessionEvent::PtcCompleted { .. }).then_some(record.seq)
+            (record.event.task_id() == Some(view.task_id)
+                && matches!(record.event, SessionEvent::PtcCompleted { .. }))
+            .then_some(record.seq)
         });
         let latest_failed_seq = window.iter().rev().find_map(|record| {
-            matches!(record.event, SessionEvent::PtcFailed { .. }).then_some(record.seq)
+            (record.event.task_id() == Some(view.task_id)
+                && matches!(record.event, SessionEvent::PtcFailed { .. }))
+            .then_some(record.seq)
         });
         let dialogue_start = window
             .iter()
@@ -344,6 +368,26 @@ impl ContextCompiler {
     }
 }
 
+/// Completed ancestors whose messages form this task's conversation history.
+fn conversation_task_ids(view: &TaskView, events: &[EventRecord]) -> HashSet<TaskId> {
+    let mut ids = HashSet::new();
+    let mut previous = view.previous_task;
+    while let Some(task_id) = previous {
+        if !ids.insert(task_id) {
+            break;
+        }
+        previous = events.iter().rev().find_map(|record| match record.event {
+            SessionEvent::TaskStarted {
+                task_id: id,
+                previous_task,
+                ..
+            } if id == task_id => previous_task,
+            _ => None,
+        });
+    }
+    ids
+}
+
 fn event_item(
     record: &EventRecord,
     latest_user_seq: Option<u64>,
@@ -358,7 +402,7 @@ fn event_item(
         {
             Some(item(
                 ContextSource::SessionEvent(record.seq),
-                Priority::Ephemeral,
+                Priority::Sticky,
                 format!("[recent conversation]\nUser: {content}"),
             ))
         }

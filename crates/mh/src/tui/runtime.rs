@@ -79,6 +79,10 @@ pub(super) enum ObserverControl {
 pub(super) enum RunRequest {
     New(String),
     Resume(TaskId),
+    Followup {
+        previous_task: TaskId,
+        message: String,
+    },
 }
 
 pub(super) struct Observer {
@@ -322,6 +326,15 @@ pub(super) fn execute_run<M: Model + 'static>(
         RunRequest::Resume(task_id) => task_id,
         RunRequest::New(task) => {
             let task_id = Agent::<M>::start_detached_task(workspace, &task)?;
+            let _ = events.send(UiEvent::Registered { run_id, task_id });
+            task_id
+        }
+        RunRequest::Followup {
+            previous_task,
+            message,
+        } => {
+            let task_id =
+                Agent::<M>::start_detached_followup_task(workspace, previous_task, &message)?;
             let _ = events.send(UiEvent::Registered { run_id, task_id });
             task_id
         }

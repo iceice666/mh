@@ -240,6 +240,9 @@ impl ProcessRecord {
 pub struct TaskView {
     pub task_id: TaskId,
     pub agent: AgentId,
+    /// Completed root task whose conversation this task continues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_task: Option<TaskId>,
     pub goal: GoalState,
     /// Zero-based index of the active context window.
     pub window: u32,
@@ -381,6 +384,8 @@ pub enum SessionEvent {
     TaskStarted {
         task_id: TaskId,
         objective: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_task: Option<TaskId>,
         base_revision: RevisionId,
         #[serde(default = "default_activate_task")]
         activate: bool,
@@ -999,24 +1004,60 @@ impl Session {
     }
 
     pub fn begin_task(&self, objective: &str) -> Result<TaskId, SessionError> {
-        self.begin_task_with_activation(objective, true)
+        self.begin_task_with_activation(objective, true, None)
     }
 
     pub fn register_queued_task(&self, objective: &str) -> Result<TaskId, SessionError> {
-        self.begin_task_with_activation(objective, false)
+        self.begin_task_with_activation(objective, false, None)
+    }
+
+    /// Starts a new root task while retaining the completed task's conversation.
+    pub fn begin_followup_task(
+        &self,
+        previous_task: TaskId,
+        objective: &str,
+    ) -> Result<TaskId, SessionError> {
+        self.begin_task_with_activation(objective, true, Some(previous_task))
+    }
+
+    /// Registers a queued follow-up before a worker competes for admission.
+    pub fn register_queued_followup_task(
+        &self,
+        previous_task: TaskId,
+        objective: &str,
+    ) -> Result<TaskId, SessionError> {
+        self.begin_task_with_activation(objective, false, Some(previous_task))
     }
 
     fn begin_task_with_activation(
         &self,
         objective: &str,
         activate: bool,
+        previous_task: Option<TaskId>,
     ) -> Result<TaskId, SessionError> {
         let objective = objective.to_string();
         let record = self.transact(|events, state| {
+            if let Some(previous_task) = previous_task {
+                let previous = derive_task(state, events, previous_task);
+                if !previous.agent.is_root() {
+                    return Err(SessionError::State(format!(
+                        "task {} is not a root conversation",
+                        previous_task.0
+                    )));
+                }
+                if previous.status() != TaskStatus::Completed {
+                    return Err(SessionError::State(format!(
+                        "task {} is {}; follow-up requires a completed task",
+                        previous_task.0,
+                        previous.status().label()
+                    )));
+                }
+            }
             let task_id = next_id(events.iter().filter_map(task_id_in_event))?;
             Ok(Some(SessionEvent::TaskStarted {
                 task_id: TaskId(task_id),
                 objective,
+                previous_task,
                 base_revision: state.current_revision.clone(),
                 activate,
             }))
@@ -1994,6 +2035,7 @@ fn derive_task(state: &SessionState, events: &[EventRecord], task_id: TaskId) ->
     let mut view = TaskView {
         task_id,
         agent: AgentId::ROOT,
+        previous_task: None,
         goal: goal.clone(),
         window: 0,
         turns_in_window: 0,
@@ -2027,6 +2069,7 @@ fn derive_task(state: &SessionState, events: &[EventRecord], task_id: TaskId) ->
             SessionEvent::TaskStarted {
                 task_id: id,
                 objective,
+                previous_task,
                 base_revision,
                 activate,
             } if *id == task_id => {
@@ -2034,6 +2077,7 @@ fn derive_task(state: &SessionState, events: &[EventRecord], task_id: TaskId) ->
                 if !*activate {
                     goal.status = TaskStatus::Queued;
                 }
+                view.previous_task = *previous_task;
                 view.base_revision = Some(base_revision.clone());
                 view.changed_paths.clear();
                 view.evidence.clear();

@@ -245,6 +245,7 @@ impl Loop {
                 let target = match &request {
                     RunRequest::New(_) => Target::New,
                     RunRequest::Resume(task_id) => Target::Task(*task_id),
+                    RunRequest::Followup { previous_task, .. } => Target::Task(*previous_task),
                 };
                 match runtime::spawn_worker(
                     workspace.to_path_buf(),

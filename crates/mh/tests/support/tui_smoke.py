@@ -621,6 +621,7 @@ def scenario_stream_and_steer(binary: str) -> None:
             ),
             Turn([text_delta("waiting"), completed("resp_waiting")]),
             Turn(ptc_call('return finish({ summary: "done", force: true });')),
+            Turn([text_delta("follow-up answer"), completed("resp_followup")]),
         ]
     )
     with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as workspace:
@@ -680,14 +681,31 @@ def scenario_stream_and_steer(binary: str) -> None:
             records = journal(workspace)
             started = events(records, "task_started")
             if len(started) != 1:
-                raise Failure(f"the follow-up started {len(started)} tasks")
+                raise Failure(f"the waiting-user follow-up started {len(started)} tasks")
             completions = events(records, "task_completed")
             if len(completions) != 1:
                 raise Failure(f"{len(completions)} completion records")
+            report("waiting_user_followup_completes_same_task")
+
+            # Completion ends the task, not the conversation. A message in the
+            # same composer starts a linked task and receives another answer.
+            session.send("explain the result")
+            session.send(ENTER)
+            session.wait_screen("follow-up answer")
+            records = journal(workspace)
+            started = events(records, "task_started")
+            if len(started) != 2:
+                raise Failure(f"the completed follow-up started {len(started)} tasks")
+            if started[1].get("previous_task") != 1:
+                raise Failure(f"follow-up task was not linked: {started[1]}")
+            rendered = json.dumps(provider.bodies()[-1], ensure_ascii=False)
+            if "waiting" not in rendered or "explain the result" not in rendered:
+                raise Failure("completed follow-up lost recent conversation context")
+            report("completed_task_accepts_a_linked_followup")
+
             session.send(CTRL_Q)
             if session.wait_exit() != 0:
-                raise Failure("exit after completion failed")
-            report("waiting_user_followup_completes_same_task")
+                raise Failure("exit after completion follow-up failed")
         finally:
             session.close()
             provider.close()

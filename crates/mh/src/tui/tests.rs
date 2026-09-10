@@ -341,7 +341,7 @@ fn selected_task_controls_are_explicit() {
         .collect();
     assert_eq!(commands, vec![task_a, task_a], "B received a command");
 
-    // A terminal task refuses resume and keeps the draft.
+    // A cancelled task still refuses submission and keeps the draft.
     let session = Session::command(workspace).unwrap();
     session
         .append_shared_event(SessionEvent::TaskStatusChanged {
@@ -351,8 +351,8 @@ fn selected_task_controls_are_explicit() {
         })
         .unwrap();
     observe_once(&mut app, workspace);
-    type_text(&mut app, "again");
     assert_eq!(app.plan(Action::Resume(task_a)), super::Plan::Nothing);
+    type_text(&mut app, "again");
     let submit = app.plan(Action::Submit {
         target: Target::Task(task_a),
         text: "again".to_string(),
@@ -366,6 +366,125 @@ fn selected_task_controls_are_explicit() {
             .any(|notice| notice.text.contains("cancelled") && notice.text.contains("Ctrl-N")),
         "{notices:?}"
     );
+}
+
+#[test]
+fn completed_task_submit_starts_linked_followup() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().to_path_buf();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let controls = std::sync::mpsc::channel();
+
+    let agent = Agent::new(support::RoleModel::new(vec![finish("done")]), config());
+    let outcome = execute_run(
+        &agent,
+        &workspace,
+        RunRequest::New("first request".to_string()),
+        &cancelled,
+        &controls.1,
+        &event_tx,
+        1,
+    )
+    .unwrap();
+    assert!(outcome.is_complete());
+
+    let mut app = App::new(&workspace);
+    app.plan(Action::Submit {
+        target: Target::New,
+        text: "first request".to_string(),
+    });
+    drain(&mut app, &event_rx);
+    let completed = app.local_task().unwrap();
+    app.worker_finished(1, Ok(outcome));
+    observe_once(&mut app, &workspace);
+
+    let plan = app.plan(Action::Submit {
+        target: Target::Task(completed),
+        text: "explain the result".to_string(),
+    });
+    let super::Plan::StartRun { run_id, request } = plan else {
+        panic!("expected follow-up run, got {plan:?}");
+    };
+    assert_eq!(
+        request,
+        RunRequest::Followup {
+            previous_task: completed,
+            message: "explain the result".to_string(),
+        }
+    );
+
+    let agent = Agent::new(support::RoleModel::new(vec![text("answer")]), config());
+    let outcome = execute_run(
+        &agent,
+        &workspace,
+        request,
+        &cancelled,
+        &controls.1,
+        &event_tx,
+        run_id,
+    )
+    .unwrap();
+    drain(&mut app, &event_rx);
+    let followup = app.local_task().unwrap();
+    assert_ne!(followup, completed);
+    assert_eq!(app.target(), Target::Task(followup));
+    app.worker_finished(run_id, Ok(outcome));
+    observe_once(&mut app, &workspace);
+
+    let tasks = Session::inspect(&workspace).unwrap().tasks();
+    assert_eq!(tasks.len(), 2);
+    assert_eq!(tasks[1].previous_task, Some(completed));
+    let transcript = transcript(&mut app, 60);
+
+    assert!(transcript.contains("first request"), "{transcript}");
+    assert!(transcript.contains("explain the result"), "{transcript}");
+    assert!(transcript.contains("answer"), "{transcript}");
+}
+
+#[test]
+fn followup_submitted_before_completed_worker_is_reaped_is_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().to_path_buf();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let controls = std::sync::mpsc::channel();
+    let agent = Agent::new(support::RoleModel::new(vec![finish("done")]), config());
+    let outcome = execute_run(
+        &agent,
+        &workspace,
+        RunRequest::New("first request".to_string()),
+        &cancelled,
+        &controls.1,
+        &event_tx,
+        1,
+    )
+    .unwrap();
+
+    let mut app = App::new(&workspace);
+    app.plan(Action::Submit {
+        target: Target::New,
+        text: "first request".to_string(),
+    });
+    drain(&mut app, &event_rx);
+    let completed = app.local_task().unwrap();
+    observe_once(&mut app, &workspace);
+    assert_eq!(
+        app.plan(Action::Submit {
+            target: Target::Task(completed),
+            text: "raced follow-up".to_string(),
+        }),
+        super::Plan::Nothing
+    );
+
+    app.worker_finished(1, Ok(outcome));
+    assert!(matches!(
+        app.take_followup(),
+        Some(super::Plan::StartRun {
+            request: RunRequest::Followup { previous_task, message },
+            ..
+        }) if previous_task == completed && message == "raced follow-up"
+    ));
 }
 
 #[test]

@@ -363,6 +363,9 @@ pub(super) struct App {
     /// Set when a durable steer should be followed by an explicit resume.
     resume_after_receipt: Option<TaskId>,
     followup: Option<Plan>,
+    /// Message submitted after durable completion but before the local worker
+    /// has been reaped.
+    pending_completed_followup: Option<(TaskId, String)>,
     cancel_interrupt: Option<TaskId>,
     trust: Option<TrustPrompt>,
     help: bool,
@@ -406,6 +409,7 @@ impl App {
             submitting: None,
             resume_after_receipt: None,
             followup: None,
+            pending_completed_followup: None,
             cancel_interrupt: None,
             trust: None,
             help: false,
@@ -668,10 +672,8 @@ impl App {
         };
         run.task_id = Some(task_id);
         self.live_revision += 1;
-        if self.target == Target::New {
-            self.target = Target::Task(task_id);
-        }
-        if self.submitting == Some(Target::New) {
+        self.target = Target::Task(task_id);
+        if matches!(self.submitting, Some(Target::New | Target::Task(_))) {
             self.submitting = None;
         }
     }
@@ -819,11 +821,27 @@ impl App {
             Ok(TaskOutcome::Completed(_) | TaskOutcome::AwaitingUser(_))
         );
         match result {
-            Ok(TaskOutcome::Completed(summary)) => self.notice(
-                target,
-                Level::Info,
-                format!("completed: {}", display_line(&summary)),
-            ),
+            Ok(TaskOutcome::Completed(summary)) => {
+                self.notice(
+                    target,
+                    Level::Info,
+                    format!("completed: {}", display_line(&summary)),
+                );
+                if let Some((previous_task, message)) = self.pending_completed_followup.take()
+                    && Some(previous_task) == run.task_id
+                    && !self.quitting
+                {
+                    let run_id = self.allocate_new_run();
+                    self.submitting = Some(Target::Task(previous_task));
+                    self.followup = Some(Plan::StartRun {
+                        run_id,
+                        request: RunRequest::Followup {
+                            previous_task,
+                            message,
+                        },
+                    });
+                }
+            }
             Ok(TaskOutcome::AwaitingUser(message)) => self.notice(
                 target,
                 Level::Info,
@@ -892,6 +910,7 @@ impl App {
     pub fn drop_local(&mut self) {
         self.local = None;
         self.submitting = None;
+        self.pending_completed_followup = None;
         self.live_revision += 1;
         self.dirty = true;
     }
@@ -1460,7 +1479,6 @@ impl App {
             request: RunRequest::New(text),
         }
     }
-
     fn plan_task_submit(&mut self, task_id: TaskId, text: String) -> Plan {
         let target = Target::Task(task_id);
         let Some(view) = self.selected_view().filter(|view| view.task_id == task_id) else {
@@ -1468,6 +1486,31 @@ impl App {
             return Plan::Nothing;
         };
         let status = view.status();
+        let local_here = self.local_task() == Some(task_id);
+        if status == TaskStatus::Completed {
+            if local_here {
+                if self.pending_completed_followup.is_some() {
+                    self.notice(target, Level::Warn, "Follow-up already pending");
+                    return Plan::Nothing;
+                }
+                self.pending_completed_followup = Some((task_id, text));
+                self.submitting = Some(target);
+                return Plan::Nothing;
+            }
+            if self.local.is_some() {
+                self.notice(target, Level::Warn, "Another task is running locally");
+                return Plan::Nothing;
+            }
+            let run_id = self.allocate_new_run();
+            self.submitting = Some(target);
+            return Plan::StartRun {
+                run_id,
+                request: RunRequest::Followup {
+                    previous_task: task_id,
+                    message: text,
+                },
+            };
+        }
         if !status.is_active() {
             self.notice(
                 target,
@@ -1476,8 +1519,16 @@ impl App {
             );
             return Plan::Nothing;
         }
-        let local_here = self.local_task() == Some(task_id);
         if local_here {
+            if self.has_completed_event(task_id) {
+                if self.pending_completed_followup.is_some() {
+                    self.notice(target, Level::Warn, "Follow-up already pending");
+                    return Plan::Nothing;
+                }
+                self.pending_completed_followup = Some((task_id, text));
+                self.submitting = Some(target);
+                return Plan::Nothing;
+            }
             let admitted = self
                 .local
                 .as_ref()
@@ -1499,6 +1550,17 @@ impl App {
             cancel: false,
         });
         Plan::DurableSteer { task_id, text }
+    }
+
+    fn has_completed_event(&self, task_id: TaskId) -> bool {
+        self.snapshot.as_ref().is_some_and(|snapshot| {
+            snapshot.events.iter().rev().any(|record| {
+                matches!(
+                    record.event,
+                    SessionEvent::TaskCompleted { task_id: id, .. } if id == task_id
+                )
+            })
+        })
     }
 
     fn plan_resume(&mut self, task_id: TaskId) -> Plan {
@@ -1757,15 +1819,28 @@ impl App {
         let Some(snapshot) = self.snapshot.as_ref() else {
             return Vec::new();
         };
+        let mut conversation = Vec::new();
+        let mut current = Some(task_id);
+        while let Some(id) = current {
+            if conversation.contains(&id) {
+                break;
+            }
+            conversation.push(id);
+            current = snapshot
+                .tasks
+                .iter()
+                .find(|view| view.task_id == id)
+                .and_then(|view| view.previous_task);
+        }
         let mut entries: Vec<Entry> = Vec::new();
         let mut steering: HashMap<u64, usize> = HashMap::new();
         let mut calls: HashMap<(ExecutionId, u64), usize> = HashMap::new();
         let mut executions: HashMap<ExecutionId, usize> = HashMap::new();
         for record in &snapshot.events {
             let event = &record.event;
-            let belongs = event.task_id() == Some(task_id)
+            let belongs = event.task_id().is_some_and(|id| conversation.contains(&id))
                 || matches!(event, SessionEvent::AgentSpawned { parent_task_id, .. }
-                    if *parent_task_id == task_id);
+                    if conversation.contains(parent_task_id));
             if !belongs {
                 continue;
             }
