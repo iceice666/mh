@@ -615,6 +615,11 @@ PTC JavaScript uses var/function/return/if/for/while and these synchronous globa
 
 Durable task state:
 - goal({objective?, acceptanceCriteria?, completed?, pending?, blockers?, decisions?, findings?, failedApproaches?, nextActions?}) — each field replaces that list
+  objective is one string; every other field is an array. Array entries may be plain strings:
+  goal({objective:'port the parser', pending:['handle escapes'], acceptanceCriteria:['tests pass']})
+  Object form adds detail: pending:[{title, detail?}], acceptanceCriteria:[{description, met?, evidenceKind?}],
+  blockers:[{summary, needs?}], findings:[{summary, paths?}], decisions:[{decision, rationale?}],
+  failedApproaches:[{approach, reason}] (both required), nextActions:[string]
 - finish({summary, unresolved?, evidence?, force?}) -> {accepted, objections, waived}. A refusal explains what to resolve; it is a value, not an error. force only waives judgement about remaining work, never a live worker, running process, unmerged delta, or failed verification.
 - evidence(kind, ok, metadata?) — record verification against the current workspace revision
 

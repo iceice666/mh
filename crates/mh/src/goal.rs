@@ -54,13 +54,71 @@ impl TaskStatus {
     }
 }
 
-/// A unit of work the model committed to, tracked across context windows.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkItem {
-    pub title: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub detail: Option<String>,
+/// Defines a goal record that deserializes from either its full object form
+/// or a bare string naming its one required field.
+///
+/// Every record below is "one required string plus optional detail", so a
+/// bare string is unambiguous. Rejecting it bought nothing: the model cannot
+/// see the Rust type, so `expected struct WorkItem` is not a repairable
+/// message, and a rejected `goal()` call discards the durable state the call
+/// existed to record.
+///
+/// The shadow struct is what makes this safe: deserializing through `Shadow`
+/// rather than `Self` is what keeps the manual impl from re-entering itself.
+macro_rules! goal_record {
+    (
+        $(#[$meta:meta])*
+        pub struct $name:ident {
+            $(#[$key_meta:meta])* pub $key:ident: String,
+            $($(#[$rest_meta:meta])* pub $rest:ident: $rest_ty:ty,)*
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+        #[serde(rename_all = "camelCase")]
+        pub struct $name {
+            $(#[$key_meta])* pub $key: String,
+            $($(#[$rest_meta])* pub $rest: $rest_ty,)*
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> Result<Self, D::Error> {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Shadow {
+                    $key: String,
+                    $(#[serde(default)] $rest: $rest_ty,)*
+                }
+                #[derive(Deserialize)]
+                #[serde(untagged)]
+                enum Either {
+                    Short(String),
+                    Full(Shadow),
+                }
+                Ok(match Either::deserialize(deserializer)? {
+                    Either::Short(text) => Self {
+                        $key: text,
+                        $($rest: Default::default(),)*
+                    },
+                    Either::Full(shadow) => Self {
+                        $key: shadow.$key,
+                        $($rest: shadow.$rest,)*
+                    },
+                })
+            }
+        }
+    };
+}
+
+goal_record! {
+    /// A unit of work the model committed to, tracked across context windows.
+    pub struct WorkItem {
+        pub title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub detail: Option<String>,
+    }
 }
 
 impl WorkItem {
@@ -72,38 +130,39 @@ impl WorkItem {
     }
 }
 
-/// Something preventing progress that the model cannot resolve by retrying.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Blocker {
-    pub summary: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub needs: Option<String>,
+goal_record! {
+    /// Something preventing progress that the model cannot resolve by retrying.
+    pub struct Blocker {
+        pub summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub needs: Option<String>,
+    }
 }
 
-/// A condition the task must satisfy before `finish()` is honest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AcceptanceCriterion {
-    pub description: String,
-    #[serde(default)]
-    pub met: bool,
-    /// Evidence kind that demonstrates this criterion, when one applies.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_kind: Option<String>,
+goal_record! {
+    /// A condition the task must satisfy before `finish()` is honest.
+    pub struct AcceptanceCriterion {
+        pub description: String,
+        #[serde(default)]
+        pub met: bool,
+        /// Evidence kind that demonstrates this criterion, when one applies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub evidence_kind: Option<String>,
+    }
 }
 
-/// A durable conclusion worth carrying across a context rollover.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Finding {
-    pub summary: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub paths: Vec<PathBuf>,
+goal_record! {
+    /// A durable conclusion worth carrying across a context rollover.
+    pub struct Finding {
+        pub summary: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub paths: Vec<PathBuf>,
+    }
 }
 
 /// An approach already proven not to work. Recorded so a fresh context window
-/// does not spend its budget rediscovering the same dead end.
+/// does not spend its budget rediscovering the same dead end. Both fields are
+/// required, so there is no unambiguous string shorthand.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Failure {
@@ -111,13 +170,13 @@ pub struct Failure {
     pub reason: String,
 }
 
-/// A decision that later windows must not silently reverse.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Decision {
-    pub decision: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rationale: Option<String>,
+goal_record! {
+    /// A decision that later windows must not silently reverse.
+    pub struct Decision {
+        pub decision: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rationale: Option<String>,
+    }
 }
 
 /// Model-supplied goal state, updated through the PTC `goal()` primitive.
@@ -128,7 +187,11 @@ pub struct Decision {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GoalUpdate {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "one_string",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub objective: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acceptance_criteria: Option<Vec<AcceptanceCriterion>>,
@@ -144,7 +207,11 @@ pub struct GoalUpdate {
     pub findings: Option<Vec<Finding>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_approaches: Option<Vec<Failure>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "string_list",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub next_actions: Option<Vec<String>>,
 }
 
@@ -152,6 +219,59 @@ impl GoalUpdate {
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+}
+
+/// Accepts a string, or a one-element list holding it.
+///
+/// `objective` is a single string, but a model that has just written eight
+/// list-valued fields reliably writes `objective: ['...']` too. Collapsing a
+/// one-element list is unambiguous; a longer list is still an error, because
+/// silently dropping objectives would hide the mistake.
+fn one_string<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrList {
+        One(String),
+        List(Vec<String>),
+    }
+    match Option::<OneOrList>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(OneOrList::One(text)) => Ok(Some(text)),
+        Some(OneOrList::List(mut list)) if list.len() == 1 => Ok(list.pop()),
+        Some(OneOrList::List(list)) => Err(serde::de::Error::custom(format!(
+            "objective must be one string, got {} entries",
+            list.len()
+        ))),
+    }
+}
+
+/// Accepts a list of plain strings, or of single-key objects naming an action.
+fn string_list<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Text(String),
+        Object(serde_json::Map<String, Value>),
+    }
+    let Some(entries) = Option::<Vec<Entry>>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            Entry::Text(text) => Ok(text),
+            Entry::Object(map) => map
+                .values()
+                .find_map(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| serde::de::Error::custom("nextActions entry has no string value")),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// The durable goal of a task: what it is for, and how far it has got.
@@ -610,6 +730,73 @@ mod tests {
         assert_eq!(goal.pending_work, vec![WorkItem::new("update callers")]);
         assert_eq!(goal.completed_work, vec![WorkItem::new("moved module")]);
         assert_eq!(goal.objective, "refactor", "objective was never restated");
+    }
+
+    /// Every shape here was produced by a real model run and rejected, which
+    /// stalled the task: twelve consecutive `goal()` calls failed and no
+    /// durable state was recorded.
+    #[test]
+    fn goal_accepts_the_shapes_models_actually_write() {
+        let update: GoalUpdate = serde_json::from_value(serde_json::json!({
+            "objective": ["explain what this project does"],
+            "acceptanceCriteria": ["inspect docs and code"],
+            "pending": ["read the manifests"],
+            "completed": ["listed the repository"],
+            "blockers": ["needs network access"],
+            "findings": ["it is a Rust coding agent"],
+            "decisions": ["report in Traditional Chinese"],
+            "nextActions": [{ "action": "summarize" }],
+        }))
+        .expect("model-written goal update must be accepted");
+
+        assert_eq!(
+            update.objective.as_deref(),
+            Some("explain what this project does"),
+            "a one-element objective list collapses to the string"
+        );
+        assert_eq!(
+            update.acceptance_criteria.unwrap()[0].description,
+            "inspect docs and code"
+        );
+        assert_eq!(update.pending.unwrap()[0].title, "read the manifests");
+        assert_eq!(update.completed.unwrap()[0].title, "listed the repository");
+        assert_eq!(update.blockers.unwrap()[0].summary, "needs network access");
+        assert_eq!(
+            update.findings.unwrap()[0].summary,
+            "it is a Rust coding agent"
+        );
+        assert_eq!(
+            update.decisions.unwrap()[0].decision,
+            "report in Traditional Chinese"
+        );
+        assert_eq!(update.next_actions.unwrap(), vec!["summarize".to_string()]);
+    }
+
+    #[test]
+    fn goal_object_form_still_carries_detail() {
+        let update: GoalUpdate = serde_json::from_value(serde_json::json!({
+            "pending": [{ "title": "port parser", "detail": "escapes first" }],
+            "acceptanceCriteria": [{ "description": "tests pass", "met": true }],
+            "failedApproaches": [{ "approach": "regex", "reason": "nested quotes" }],
+        }))
+        .expect("object form must keep working");
+
+        let pending = update.pending.unwrap();
+        assert_eq!(pending[0].detail.as_deref(), Some("escapes first"));
+        assert!(update.acceptance_criteria.unwrap()[0].met);
+        assert_eq!(update.failed_approaches.unwrap()[0].reason, "nested quotes");
+    }
+
+    #[test]
+    fn a_multi_entry_objective_is_still_rejected() {
+        let error = serde_json::from_value::<GoalUpdate>(serde_json::json!({
+            "objective": ["first", "second"],
+        }))
+        .expect_err("dropping an objective must not pass silently");
+        assert!(
+            error.to_string().contains("one string"),
+            "error must name the expected shape: {error}"
+        );
     }
 
     #[test]

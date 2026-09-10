@@ -835,9 +835,19 @@ unsafe fn run_host_call(
         "goal" => {
             let host = orchestration_host(d, "goal")?;
             let update = arg(0).ok_or("goal(update)")?;
+            // The model cannot see Rust types, so a bare serde message like
+            // "expected struct WorkItem" is not actionable. Name the shape.
             let update: GoalUpdate =
-                serde_json::from_value(vm_to_json(vm, update, d.budget.max_output_bytes))
-                    .map_err(|error| format!("goal: invalid update: {error}"))?;
+                serde_json::from_value(vm_to_json(vm, update, d.budget.max_output_bytes)).map_err(
+                    |error| {
+                        format!(
+                            "goal: invalid update: {error}. objective is one string; \
+                             acceptanceCriteria/completed/pending/blockers/decisions/findings/\
+                             nextActions are arrays whose entries may be plain strings; \
+                             failedApproaches entries need {{approach, reason}}"
+                        )
+                    },
+                )?;
             let goal = host
                 .goal_update(&d.state.execution, update)
                 .map_err(|error| host_error("goal", &error))?;
