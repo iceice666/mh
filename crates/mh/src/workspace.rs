@@ -367,17 +367,11 @@ fn capture_manifest(workspace: &Path, backend: &Backend) -> Result<Manifest, Wor
     let (head, paths) = match backend {
         Backend::Git => {
             let head = git_head(workspace)?;
-            let tracked = git_head_paths(workspace)?;
-            let all = walk_paths(workspace, false)?;
-            let mut selected = tracked;
-            for path in all {
-                if selected.contains(&path) || !git_ignored(workspace, &path)? {
-                    selected.insert(path);
-                }
-            }
+            let mut selected = git_head_paths(workspace)?;
+            selected.extend(git_listed_paths(workspace)?);
             (Some(head), selected)
         }
-        Backend::Filesystem => (None, walk_paths(workspace, true)?),
+        Backend::Filesystem => (None, walk_paths(workspace)?),
     };
     let mut entries = Vec::with_capacity(paths.len());
     for path in paths {
@@ -450,12 +444,37 @@ fn manifest_id(manifest: &Manifest) -> RevisionId {
     RevisionId(format!("sha256:{:x}", hash.finalize()))
 }
 
+/// Paths git reports for the tree: `HEAD` is the durable record even for files
+/// the worktree no longer has, and vanished paths are dropped later by the
+/// metadata read in [`capture_manifest`].
 fn git_head_paths(workspace: &Path) -> Result<BTreeSet<PathBuf>, WorkspaceError> {
+    git_paths(workspace, "ls-tree", &["-r", "-z", "--name-only", "HEAD"])
+}
+
+/// Every index entry plus every untracked, non-ignored worktree file, resolved
+/// in a single git invocation. Spawning `git check-ignore` per path instead is
+/// quadratic-feeling in practice: a workspace with a populated `target/` costs
+/// six figures of process spawns and never finishes.
+fn git_listed_paths(workspace: &Path) -> Result<BTreeSet<PathBuf>, WorkspaceError> {
+    git_paths(
+        workspace,
+        "ls-files",
+        &["-z", "--cached", "--others", "--exclude-standard"],
+    )
+}
+
+fn git_paths(
+    workspace: &Path,
+    operation: &'static str,
+    args: &[&str],
+) -> Result<BTreeSet<PathBuf>, WorkspaceError> {
     let output = git_command(workspace)
-        .args(["ls-tree", "-r", "-z", "--name-only", "HEAD"])
+        .arg(operation)
+        .args(args)
+        .stderr(Stdio::null())
         .output()
         .map_err(|e| WorkspaceError::Git {
-            operation: "ls-tree",
+            operation,
             message: e.to_string(),
         })?;
     if !output.status.success() {
@@ -470,28 +489,6 @@ fn git_head_paths(workspace: &Path) -> Result<BTreeSet<PathBuf>, WorkspaceError>
         .collect())
 }
 
-fn git_ignored(workspace: &Path, path: &Path) -> Result<bool, WorkspaceError> {
-    let status = git_command(workspace)
-        .args(["check-ignore", "--no-index", "-q", "--"])
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| WorkspaceError::Git {
-            operation: "check-ignore",
-            message: e.to_string(),
-        })?;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(WorkspaceError::Git {
-            operation: "check-ignore",
-            message: format!("exit status {status}"),
-        }),
-    }
-}
-
 fn git_command(workspace: &Path) -> Command {
     let mut command = Command::new("git");
     command
@@ -502,14 +499,13 @@ fn git_command(workspace: &Path) -> Command {
     command
 }
 
-fn walk_paths(
-    workspace: &Path,
-    fallback_excludes: bool,
-) -> Result<BTreeSet<PathBuf>, WorkspaceError> {
+/// Non-git fallback walk. Without git's ignore rules this is the only place
+/// that must hard-code the build-output directories a scan would otherwise
+/// drown in.
+fn walk_paths(workspace: &Path) -> Result<BTreeSet<PathBuf>, WorkspaceError> {
     fn visit(
         root: &Path,
         relative: &Path,
-        fallback: bool,
         out: &mut BTreeSet<PathBuf>,
     ) -> Result<(), WorkspaceError> {
         let dir = root.join(relative);
@@ -532,14 +528,14 @@ fn walk_paths(
                 }
             };
             let path = relative.join(item.file_name());
-            if excluded_always(&path) || (fallback && excluded_fallback(&path)) {
+            if excluded_always(&path) || excluded_fallback(&path) {
                 continue;
             }
             let Ok(ty) = item.file_type() else {
                 continue;
             };
             if ty.is_dir() {
-                visit(root, &path, fallback, out)?;
+                visit(root, &path, out)?;
             } else if ty.is_file() || ty.is_symlink() {
                 out.insert(path);
             }
@@ -547,7 +543,7 @@ fn walk_paths(
         Ok(())
     }
     let mut out = BTreeSet::new();
-    visit(workspace, Path::new(""), fallback_excludes, &mut out)?;
+    visit(workspace, Path::new(""), &mut out)?;
     Ok(out)
 }
 
