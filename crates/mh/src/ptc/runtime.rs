@@ -227,10 +227,28 @@ unsafe extern "C" fn interrupt_handler(
 }
 
 /// Rooted JS value guard (GC-move-safe).
+///
+/// The engine keeps temporary roots on a strict LIFO stack: `JS_PopGCRef`
+/// assigns `ctx->top_gc_ref = ref->prev`, so popping anything other than the
+/// current top silently unroots every root pushed after it. A subsequent
+/// allocation then lets the compacting GC move or reclaim values the host is
+/// still holding, which corrupts the heap instead of failing.
+///
+/// Popping therefore only ever happens in `Drop`. Rust drops locals in reverse
+/// declaration order, which is exactly the required LIFO order, so a caller
+/// gets the discipline for free by reading the value with [`GcRoot::get`] and
+/// letting the guard fall out of scope.
 struct GcRoot<'v> {
     vm: &'v Vm,
     root: Box<mh_quickjs_sys::JSGCRef>,
-    active: bool,
+}
+
+// Debug-only shadow of the engine's root stack, so an out-of-order pop is a
+// loud panic in tests rather than heap corruption in production.
+#[cfg(debug_assertions)]
+thread_local! {
+    static GC_ROOT_STACK: std::cell::RefCell<Vec<*const mh_quickjs_sys::JSGCRef>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl<'v> GcRoot<'v> {
@@ -243,28 +261,35 @@ impl<'v> GcRoot<'v> {
         });
         let slot = unsafe { mh_quickjs_sys::JS_PushGCRef(vm.ctx(), root.as_mut()) };
         unsafe { *slot = val };
-        Self {
-            vm,
-            root,
-            active: true,
-        }
+        #[cfg(debug_assertions)]
+        GC_ROOT_STACK.with(|stack| {
+            stack
+                .borrow_mut()
+                .push(std::ptr::from_ref(root.as_ref()).cast());
+        });
+        Self { vm, root }
     }
 
+    /// The current value. Re-read after any allocation: a compacting GC
+    /// updates the rooted slot in place.
     fn get(&self) -> JSValue {
         self.root.val
-    }
-
-    fn pop(mut self) -> JSValue {
-        self.active = false;
-        unsafe { mh_quickjs_sys::JS_PopGCRef(self.vm.ctx(), self.root.as_mut()) }
     }
 }
 
 impl Drop for GcRoot<'_> {
     fn drop(&mut self) {
-        if self.active {
-            unsafe { mh_quickjs_sys::JS_PopGCRef(self.vm.ctx(), self.root.as_mut()) };
-        }
+        #[cfg(debug_assertions)]
+        GC_ROOT_STACK.with(|stack| {
+            let popped = stack.borrow_mut().pop();
+            assert_eq!(
+                popped,
+                Some(std::ptr::from_ref(self.root.as_ref()).cast()),
+                "GC roots must be released in LIFO order; an out-of-order pop \
+                 unroots every root above it and corrupts the engine heap"
+            );
+        });
+        unsafe { mh_quickjs_sys::JS_PopGCRef(self.vm.ctx(), self.root.as_mut()) };
     }
 }
 
@@ -800,10 +825,12 @@ unsafe fn run_host_call(
             }
             let arr = unsafe { GcRoot::new(vm, v.array(outputs.len())) };
             for (index, output) in outputs.iter().enumerate() {
+                // The child root must be released before `arr` is read again,
+                // so it lives and dies inside this iteration.
                 let child = unsafe { GcRoot::new(vm, tool_value_to_vm(vm, d, &tool_name, output)) };
                 let _ = v.set_index(arr.get(), index as u32, child.get());
             }
-            Ok(arr.pop())
+            Ok(arr.get())
         }
         "goal" => {
             let host = orchestration_host(d, "goal")?;
@@ -1505,19 +1532,15 @@ fn collection_to_vm(vm: &Vm, output: &Value, key: &str) -> JSValue {
         let child = unsafe { GcRoot::new(vm, json_to_vm(vm, value)) };
         let _ = v.set_index(array.get(), index as u32, child.get());
     }
-    let truncated = unsafe {
-        GcRoot::new(
-            vm,
-            v.bool(
-                output
-                    .get("truncated")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            ),
-        )
-    };
-    let _ = v.set(array.get(), "truncated", truncated.get());
-    array.pop()
+    // A bool is an immediate, never a heap pointer, so it needs no root.
+    let truncated = v.bool(
+        output
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    let _ = v.set(array.get(), "truncated", truncated);
+    array.get()
 }
 
 fn tool_value_to_vm(vm: &Vm, d: &DispatchBox, name: &str, output: &Value) -> JSValue {
@@ -1537,53 +1560,56 @@ fn exec_result_to_vm(vm: &Vm, d: &DispatchBox, out: &Value) -> JSValue {
         return json_to_vm(vm, out);
     }
     let obj = unsafe { GcRoot::new(vm, v.object()) };
-    let exit = unsafe { GcRoot::new(vm, v.i64(out["exitCode"].as_i64().unwrap_or(-1))) };
-    let duration = unsafe { GcRoot::new(vm, v.i64(out["durationMs"].as_i64().unwrap_or(0))) };
-    let _ = v.set(obj.get(), "exitCode", exit.get());
-    let _ = v.set(obj.get(), "durationMs", duration.get());
+    {
+        let exit = unsafe { GcRoot::new(vm, v.i64(out["exitCode"].as_i64().unwrap_or(-1))) };
+        let _ = v.set(obj.get(), "exitCode", exit.get());
+    }
+    {
+        let duration = unsafe { GcRoot::new(vm, v.i64(out["durationMs"].as_i64().unwrap_or(0))) };
+        let _ = v.set(obj.get(), "durationMs", duration.get());
+    }
 
-    let make_handle = |id: u64, key: &str| -> JSValue {
-        let h = unsafe { GcRoot::new(vm, v.object()) };
+    // The handle is attached to its parent while still rooted. Returning an
+    // unrooted value here would leave it exposed to the next allocation.
+    let attach_handle = |parent: &GcRoot<'_>, id: u64, key: &str| {
+        let handle = unsafe { GcRoot::new(vm, v.object()) };
         for method in ["read", "head", "tail", "grep", "json"] {
             let params = unsafe { GcRoot::new(vm, v.string(&format!("tr_{method}"))) };
             let method_fn = unsafe { GcRoot::new(vm, v.closure(params.get())) };
-            let _ = v.set(h.get(), method, method_fn.get());
+            let _ = v.set(handle.get(), method, method_fn.get());
         }
         let metadata = d.store.metadata(ResultId(id));
-        let id_value = unsafe { GcRoot::new(vm, v.i64(i64::try_from(id).unwrap_or(i64::MAX))) };
-        let kind = unsafe { GcRoot::new(vm, v.string(key)) };
-        let length =
-            unsafe { GcRoot::new(vm, v.i64(metadata.map(|m| m.length as i64).unwrap_or(0))) };
-        let total = unsafe {
-            GcRoot::new(
-                vm,
-                v.i64(metadata.map(|m| m.total_bytes as i64).unwrap_or(0)),
-            )
-        };
-        let truncated = unsafe { GcRoot::new(vm, v.bool(metadata.is_some_and(|m| m.truncated))) };
-        let _ = v.set(h.get(), "id", id_value.get());
-        let _ = v.set(h.get(), "kind", kind.get());
-        let _ = v.set(h.get(), "length", length.get());
-        let _ = v.set(h.get(), "totalBytes", total.get());
-        let _ = v.set(h.get(), "truncated", truncated.get());
-        h.pop()
+        {
+            let id_value = unsafe { GcRoot::new(vm, v.i64(i64::try_from(id).unwrap_or(i64::MAX))) };
+            let _ = v.set(handle.get(), "id", id_value.get());
+        }
+        {
+            let kind = unsafe { GcRoot::new(vm, v.string(key)) };
+            let _ = v.set(handle.get(), "kind", kind.get());
+        }
+        {
+            let length =
+                unsafe { GcRoot::new(vm, v.i64(metadata.map(|m| m.length as i64).unwrap_or(0))) };
+            let _ = v.set(handle.get(), "length", length.get());
+        }
+        {
+            let total = unsafe {
+                GcRoot::new(
+                    vm,
+                    v.i64(metadata.map(|m| m.total_bytes as i64).unwrap_or(0)),
+                )
+            };
+            let _ = v.set(handle.get(), "totalBytes", total.get());
+        }
+        // Immediate; no root required.
+        let truncated = v.bool(metadata.is_some_and(|m| m.truncated));
+        let _ = v.set(handle.get(), "truncated", truncated);
+        let _ = v.set(parent.get(), key, handle.get());
     };
 
-    let stdout = unsafe {
-        GcRoot::new(
-            vm,
-            make_handle(out["stdoutId"].as_u64().unwrap_or(0), "stdout"),
-        )
-    };
-    let stderr = unsafe {
-        GcRoot::new(
-            vm,
-            make_handle(out["stderrId"].as_u64().unwrap_or(0), "stderr"),
-        )
-    };
-    let _ = v.set(obj.get(), "stdout", stdout.get());
-    let _ = v.set(obj.get(), "stderr", stderr.get());
-    obj.pop()
+    attach_handle(&obj, out["stdoutId"].as_u64().unwrap_or(0), "stdout");
+    attach_handle(&obj, out["stderrId"].as_u64().unwrap_or(0), "stderr");
+    obj.get()
 }
 
 // ---------------------------------------------------------------------------
@@ -1693,7 +1719,7 @@ fn json_to_vm(vm: &Vm, v: &Value) -> JSValue {
                 let child = unsafe { GcRoot::new(vm, json_to_vm(vm, item)) };
                 let _ = vals.set_index(arr.get(), i as u32, child.get());
             }
-            arr.pop()
+            arr.get()
         }
         Value::Object(map) => {
             let obj = unsafe { GcRoot::new(vm, vals.object()) };
@@ -1701,7 +1727,7 @@ fn json_to_vm(vm: &Vm, v: &Value) -> JSValue {
                 let child = unsafe { GcRoot::new(vm, json_to_vm(vm, item)) };
                 let _ = vals.set(obj.get(), k, child.get());
             }
-            obj.pop()
+            obj.get()
         }
     }
 }
