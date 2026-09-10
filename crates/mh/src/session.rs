@@ -3086,11 +3086,23 @@ fn migrate_legacy_session(
             }
             _ => {}
         }
+        // A record the current schema cannot read is not a torn or malformed
+        // journal: it is a session written before the durable task model, so
+        // no in-place upgrade exists. Say so instead of blaming corruption.
         serde_json::from_value::<EventRecord>(value.clone()).map_err(|error| {
-            SessionError::CorruptJournal {
-                path: event_path.clone(),
-                offset: index as u64,
-                message: format!("unsupported legacy event schema: {error}"),
+            if known_event_type(&event_type) {
+                SessionError::State(format!(
+                    "session at {} predates the durable task model and cannot be upgraded \
+                     ({event_type}: {error}); archive or remove {} to start a new session",
+                    root.display(),
+                    event_path.display()
+                ))
+            } else {
+                SessionError::CorruptJournal {
+                    path: event_path.clone(),
+                    offset: index as u64,
+                    message: format!("unsupported legacy event schema: {error}"),
+                }
             }
         })?;
         values.push(value);
